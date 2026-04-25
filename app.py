@@ -404,10 +404,14 @@ def _render_sidebar(db: VFDatabase) -> tuple[Optional[int], list[int], dict]:
         id_to_row = {int(r["session_id"]): r for _, r in sessions_df.iterrows()}
         all_ids   = list(id_to_row.keys())
 
+        # Validate: if stored session no longer exists (e.g. page reload),
+        # fall back to first — but NEVER auto-switch just because a new file
+        # was uploaded.
         if st.session_state.active_session not in all_ids:
             st.session_state.active_session = all_ids[0]
 
-        # Active session selector (also controlled by top nav)
+        # Active session selector — shows the user's current selection.
+        # Changing this dropdown immediately updates the dashboard.
         st.markdown("**Active Case**")
         active_id = st.selectbox(
             "Active session",
@@ -417,7 +421,9 @@ def _render_sidebar(db: VFDatabase) -> tuple[Optional[int], list[int], dict]:
             label_visibility="collapsed",
             key="sidebar_active_sel",
         )
-        st.session_state.active_session = active_id
+        # Write back only if the user explicitly changed the dropdown
+        if active_id != st.session_state.active_session:
+            st.session_state.active_session = active_id
 
         # Comparison sessions
         st.divider()
@@ -469,7 +475,12 @@ def _render_sidebar(db: VFDatabase) -> tuple[Optional[int], list[int], dict]:
 def _process_upload(db: VFDatabase, uploaded) -> None:
     sessions_df = db.get_sessions()
     if not sessions_df.empty and uploaded.name in sessions_df["filename"].values:
-        return
+        return  # already loaded — skip silently
+
+    # Remember if the user already had a case open before this upload.
+    # If yes, we preserve their selection after the upload completes.
+    had_active = st.session_state.active_session is not None
+
     with st.sidebar:
         with st.status(f"Loading {uploaded.name}…", expanded=False) as status:
             try:
@@ -487,7 +498,12 @@ def _process_upload(db: VFDatabase, uploaded) -> None:
                 )
                 db.insert_measurements(clean_df, sid)
                 db.insert_alarm_events(clean_df, sid)
-                st.session_state.active_session = sid
+
+                # Only auto-switch to the new file on the very first upload.
+                # After that the user controls navigation themselves.
+                if not had_active:
+                    st.session_state.active_session = sid
+
                 for w in warnings:
                     st.warning(w)
                 status.update(label=f"✅ {uploaded.name}", state="complete")

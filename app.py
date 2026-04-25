@@ -550,17 +550,20 @@ def _render_case_navigator(
     all_ids: list[int],
 ) -> int:
     """
-    Renders a compact navigator bar at the top of the main content area:
-    [← Prev]  [Case dropdown]  [Next →]   |  duration · alarm status
+    Renders a slim top bar with:
+    - Case number label (read-only — selection stays in sidebar)
+    - Prev / Next navigation buttons
+    - Duration and alarm status pills
 
-    Returns the (possibly updated) active_id after navigation.
+    Returns the (possibly updated) active_id after Prev/Next navigation.
     """
-    id_to_row = {int(r["session_id"]): r for _, r in sessions_df.iterrows()}
+    id_to_row   = {int(r["session_id"]): r for _, r in sessions_df.iterrows()}
     current_idx = all_ids.index(active_id) if active_id in all_ids else 0
+    current_row = id_to_row[active_id]
 
-    nav_l, nav_mid, nav_r, nav_info = st.columns([1, 4, 1, 4])
+    nav_l, nav_case, nav_r, nav_info = st.columns([1, 3, 1, 5])
 
-    # Prev button
+    # ← Prev button
     with nav_l:
         prev_disabled = (current_idx == 0)
         if st.button(
@@ -572,22 +575,18 @@ def _render_case_navigator(
             st.session_state.active_session = active_id
             st.rerun()
 
-    # Case dropdown
-    with nav_mid:
-        new_id = st.selectbox(
-            "Navigate to case",
-            options=all_ids,
-            index=current_idx,
-            format_func=lambda k: f"Case {id_to_row[k]['case_id']}  —  {id_to_row[k]['filename']}",
-            label_visibility="collapsed",
-            key="top_nav_sel",
+    # Case label — plain text, no dropdown
+    with nav_case:
+        st.markdown(
+            f'<div style="display:flex;align-items:center;height:38px;">' 
+            f'<span style="font-size:1.1rem;font-weight:700;color:{C["primary"]};">' 
+            f'Case {current_row["case_id"]}</span>' 
+            f'<span style="font-size:.82rem;color:{C["subtle"]};margin-left:10px;">' 
+            f'({current_idx + 1} of {len(all_ids)})</span></div>',
+            unsafe_allow_html=True,
         )
-        if new_id != active_id:
-            active_id = new_id
-            st.session_state.active_session = active_id
-            st.rerun()
 
-    # Next button
+    # Next → button
     with nav_r:
         next_disabled = (current_idx >= len(all_ids) - 1)
         if st.button(
@@ -599,7 +598,7 @@ def _render_case_navigator(
             st.session_state.active_session = active_id
             st.rerun()
 
-    # Quick info pills
+    # Duration + alarm status pills
     with nav_info:
         meas_df = db.get_measurements(active_id)
         alarm_count = int(meas_df["alarm_active"].sum()) if "alarm_active" in meas_df.columns else 0
@@ -618,10 +617,9 @@ def _render_case_navigator(
             badge = '<span class="ok-badge">✓ No alarms</span>'
 
         st.markdown(
-            f'<div style="display:flex;align-items:center;gap:10px;padding-top:6px;">'
-            f'<span style="font-size:.82rem;color:{C["subtle"]};">⏱ {dur_txt}</span>'
-            f'&nbsp;{badge}'
-            f'</div>',
+            f'<div style="display:flex;align-items:center;gap:10px;padding-top:6px;">' 
+            f'<span style="font-size:.82rem;color:{C["subtle"]};">⏱ {dur_txt}</span>' 
+            f'&nbsp;{badge}</div>',
             unsafe_allow_html=True,
         )
 

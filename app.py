@@ -90,6 +90,16 @@ CHART_BASE = dict(
     ),
 )
 
+# Subset of CHART_BASE safe to pass to figures built with make_subplots.
+# Excludes xaxis/yaxis (handled per-subplot) and legend (set explicitly).
+CHART_BASE_SUB = dict(
+    plot_bgcolor="white",
+    paper_bgcolor="white",
+    font=CHART_FONT,
+    title_font=dict(family="'Segoe UI', Arial, sans-serif", size=16, color=C["primary"]),
+    margin=dict(l=60, r=40, t=60, b=60),
+)
+
 MAX_COMPARE = 5
 
 # Clinical labels for chart Y-axes (include units explicitly)
@@ -550,80 +560,50 @@ def _render_case_navigator(
     all_ids: list[int],
 ) -> int:
     """
-    Renders a slim top bar with:
-    - Case number label (read-only — selection stays in sidebar)
-    - Prev / Next navigation buttons
-    - Duration and alarm status pills
-
-    Returns the (possibly updated) active_id after Prev/Next navigation.
+    Displays a slim read-only header bar showing the active case number,
+    its position in the loaded list, duration, and alarm status.
+    Navigation is done exclusively via the sidebar dropdown.
     """
     id_to_row   = {int(r["session_id"]): r for _, r in sessions_df.iterrows()}
     current_idx = all_ids.index(active_id) if active_id in all_ids else 0
     current_row = id_to_row[active_id]
 
-    nav_l, nav_case, nav_r, nav_info = st.columns([1, 3, 1, 5])
+    meas_df     = db.get_measurements(active_id)
+    alarm_count = int(meas_df["alarm_active"].sum()) if "alarm_active" in meas_df.columns else 0
+    total       = len(meas_df)
 
-    # ← Prev button
-    with nav_l:
-        prev_disabled = (current_idx == 0)
-        if st.button(
-            "← Prev", disabled=prev_disabled,
-            use_container_width=True,
-            help="Go to previous case" if not prev_disabled else "Already at first case",
-        ):
-            active_id = all_ids[current_idx - 1]
-            st.session_state.active_session = active_id
-            st.rerun()
+    dur_txt = "—"
+    if "timestamp" in meas_df.columns and meas_df["timestamp"].notna().any():
+        delta   = meas_df["timestamp"].max() - meas_df["timestamp"].min()
+        dur_txt = f"{int(delta.total_seconds() / 60)} min"
 
-    # Case label — plain text, no dropdown
-    with nav_case:
-        st.markdown(
-            f'<div style="display:flex;align-items:center;height:38px;">' 
-            f'<span style="font-size:1.1rem;font-weight:700;color:{C["primary"]};">' 
-            f'Case {current_row["case_id"]}</span>' 
-            f'<span style="font-size:.82rem;color:{C["subtle"]};margin-left:10px;">' 
-            f'({current_idx + 1} of {len(all_ids)})</span></div>',
-            unsafe_allow_html=True,
+    if alarm_count > 0:
+        badge = (
+            f'<span class="alarm-badge">⚠ {alarm_count:,} alarms '
+            f'({_alarm_rate(alarm_count, total)})</span>'
         )
+    else:
+        badge = '<span class="ok-badge">✓ No alarms</span>'
 
-    # Next → button
-    with nav_r:
-        next_disabled = (current_idx >= len(all_ids) - 1)
-        if st.button(
-            "Next →", disabled=next_disabled,
-            use_container_width=True,
-            help="Go to next case" if not next_disabled else "Already at last case",
-        ):
-            active_id = all_ids[current_idx + 1]
-            st.session_state.active_session = active_id
-            st.rerun()
-
-    # Duration + alarm status pills
-    with nav_info:
-        meas_df = db.get_measurements(active_id)
-        alarm_count = int(meas_df["alarm_active"].sum()) if "alarm_active" in meas_df.columns else 0
-        total       = len(meas_df)
-
-        dur_txt = "—"
-        if "timestamp" in meas_df.columns and meas_df["timestamp"].notna().any():
-            delta   = meas_df["timestamp"].max() - meas_df["timestamp"].min()
-            dur_min = int(delta.total_seconds() / 60)
-            dur_txt = f"{dur_min} min"
-
-        if alarm_count > 0:
-            badge = (f'<span class="alarm-badge">⚠ {alarm_count:,} alarms '
-                     f'({_alarm_rate(alarm_count, total)})</span>')
-        else:
-            badge = '<span class="ok-badge">✓ No alarms</span>'
-
-        st.markdown(
-            f'<div style="display:flex;align-items:center;gap:10px;padding-top:6px;">' 
-            f'<span style="font-size:.82rem;color:{C["subtle"]};">⏱ {dur_txt}</span>' 
-            f'&nbsp;{badge}</div>',
-            unsafe_allow_html=True,
-        )
+    st.markdown(
+        f'''<div style="display:flex;align-items:center;gap:18px;
+                      padding:10px 20px;margin-bottom:14px;
+                      background:{C["bg_card"]};border:1px solid {C["border"]};
+                      border-radius:10px;">
+          <span style="font-size:1.1rem;font-weight:700;color:{C["primary"]};">
+            Case {current_row["case_id"]}
+          </span>
+          <span style="font-size:.82rem;color:{C["subtle"]};">
+            {current_idx + 1} of {len(all_ids)} cases
+          </span>
+          <span style="font-size:.82rem;color:{C["subtle"]};">⏱ {dur_txt}</span>
+          {badge}
+        </div>''',
+        unsafe_allow_html=True,
+    )
 
     return active_id
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -954,7 +934,7 @@ def _tab_trends(meas_df: pd.DataFrame, alarm_df: pd.DataFrame) -> None:
     fig.update_xaxes(title_text="Date / Time", title_font=dict(size=13), row=n, col=1)
 
     fig.update_layout(
-        **{k: v for k, v in CHART_BASE.items() if k not in ("xaxis", "yaxis")},
+        **CHART_BASE_SUB,
         height=max(280, 230 * n),
         legend=dict(orientation="h", y=-0.08, x=0, font=dict(size=13)),
     )
@@ -1067,7 +1047,7 @@ def _tab_distributions(meas_df: pd.DataFrame) -> None:
                 text_auto=".2f", aspect="auto",
             )
             fig_c.update_layout(
-                **{k: v for k, v in CHART_BASE.items() if k not in ("xaxis", "yaxis")},
+                **CHART_BASE_SUB,
                 height=460,
                 font=dict(size=13),
             )
@@ -1388,7 +1368,7 @@ def _tab_cohort(
             points="outliers",
         )
         fig.update_layout(
-            **{k: v for k, v in CHART_BASE.items() if k not in ("xaxis", "yaxis")},
+            **CHART_BASE_SUB,
             title=dict(text=f"{param_label} — Distribution per Case",
                        font=dict(size=16, color=C["primary"]), x=0),
             xaxis=dict(title="", tickfont=dict(size=14)),
@@ -1697,7 +1677,7 @@ def _tab_risk(
         ), row=2, col=1)
 
         fig_c.update_layout(
-            **{k: v for k, v in CHART_BASE.items() if k not in ("xaxis", "yaxis")},
+            **CHART_BASE_SUB,
             height=380,
             legend=dict(orientation="h", y=-0.14, x=0, font=dict(size=13)),
         )

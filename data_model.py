@@ -218,6 +218,23 @@ class VFDatabase:
 
         return df
 
+    def get_measurements_multi(self, session_ids: list[int]) -> pd.DataFrame:
+        """
+        Return measurements for multiple sessions, tagged with session_id.
+        Useful for comparative analysis and cohort-level views.
+        """
+        if not session_ids:
+            return pd.DataFrame()
+        placeholders = ",".join("?" * len(session_ids))
+        df = pd.read_sql(
+            f"SELECT * FROM measurements WHERE session_id IN ({placeholders}) ORDER BY session_id, timestamp",
+            self.conn,
+            params=session_ids,
+        )
+        if "timestamp" in df.columns:
+            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        return df
+
     def get_alarm_events(self, session_id: Optional[int] = None) -> pd.DataFrame:
         if session_id is not None:
             return pd.read_sql(
@@ -227,6 +244,17 @@ class VFDatabase:
             )
         return pd.read_sql(
             "SELECT * FROM alarm_events ORDER BY timestamp", self.conn
+        )
+
+    def get_alarm_events_multi(self, session_ids: list[int]) -> pd.DataFrame:
+        """Return alarm events for multiple sessions."""
+        if not session_ids:
+            return pd.DataFrame()
+        placeholders = ",".join("?" * len(session_ids))
+        return pd.read_sql(
+            f"SELECT * FROM alarm_events WHERE session_id IN ({placeholders}) ORDER BY session_id, timestamp",
+            self.conn,
+            params=session_ids,
         )
 
     def close(self) -> None:

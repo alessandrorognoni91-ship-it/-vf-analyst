@@ -208,3 +208,77 @@ def compute_summary(df: pd.DataFrame) -> dict[str, Any]:
             summary[f"{col}_max"] = round(df[col].max(), 2)
 
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Feature Engineering for ML module
+# ---------------------------------------------------------------------------
+
+def engineer_features(df: pd.DataFrame, window: int = 10) -> pd.DataFrame:
+    """
+    Generate time-series features from clean measurements for ML training.
+
+    Features produced per measurement column:
+    - rolling_mean_{col}  : smoothed signal level
+    - rolling_std_{col}   : signal instability
+    - delta_{col}         : rate of change (first difference)
+
+    Plus cross-parameter ratios:
+    - pressure_flow_ratio : pressure delta / flow rate (instability index)
+
+    Parameters
+    ----------
+    df     : clean measurements DataFrame (one session)
+    window : rolling window size in samples (default 10 ≈ 10 seconds at 1 Hz)
+
+    Returns
+    -------
+    df with additional feature columns appended.
+    NaN rows at the start (from rolling) are dropped.
+    """
+    from config import MEASUREMENT_COLS
+
+    df = df.copy().sort_values("timestamp").reset_index(drop=True)
+
+    for col in MEASUREMENT_COLS:
+        if col not in df.columns or df[col].isna().all():
+            continue
+        s = df[col]
+        df[f"rolling_mean_{col}"] = s.rolling(window, min_periods=1).mean()
+        df[f"rolling_std_{col}"]  = s.rolling(window, min_periods=1).std().fillna(0)
+        df[f"delta_{col}"]        = s.diff().fillna(0)
+
+    # Cross-parameter ratio: instability index
+    if "pressure_delta_mmhg" in df.columns and "flow_rate_lpm" in df.columns:
+        safe_flow = df["flow_rate_lpm"].replace(0, np.nan)
+        df["pressure_flow_ratio"] = df["pressure_delta_mmhg"] / safe_flow
+        df["pressure_flow_ratio"] = df["pressure_flow_ratio"].fillna(0).clip(-50, 50)
+
+    return df
+
+
+def make_alarm_target(df: pd.DataFrame, horizon: int = 5) -> pd.DataFrame:
+    """
+    Create a forward-looking binary target: will an alarm occur within
+    the next `horizon` samples?
+
+    This is more clinically useful than predicting the current alarm state
+    (which is already known from the device).
+
+    Returns df with an added column `alarm_future` (0/1).
+    """
+    if "alarm_active" not in df.columns:
+        df["alarm_future"] = 0
+        return df
+
+    alarm_series = df["alarm_active"].astype(int)
+    # Rolling max over the next `horizon` steps
+    df["alarm_future"] = (
+        alarm_series[::-1]
+        .rolling(horizon, min_periods=1)
+        .max()[::-1]
+        .shift(-horizon)
+        .fillna(0)
+        .astype(int)
+    )
+    return df

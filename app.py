@@ -90,13 +90,11 @@ CHART_BASE = dict(
     ),
 )
 
-# Subset of CHART_BASE safe to pass to figures built with make_subplots.
-# Excludes xaxis/yaxis (handled per-subplot) and legend (set explicitly).
+# Safe minimal style applied to ALL figures (including px.imshow, px.box etc.)
+# Do NOT add font/title_font here — px figures manage those internally.
 CHART_BASE_SUB = dict(
     plot_bgcolor="white",
     paper_bgcolor="white",
-    font=CHART_FONT,
-    title_font=dict(family="'Segoe UI', Arial, sans-serif", size=16, color=C["primary"]),
     margin=dict(l=60, r=40, t=60, b=60),
 )
 
@@ -366,12 +364,13 @@ def _get_db() -> VFDatabase:
 
 def _init_state() -> None:
     defaults = {
-        "db":               _get_db(),
-        "active_session":   None,
+        "db":                _get_db(),
+        "active_session":    None,
         "selected_sessions": [],
-        "vf_model":         None,
-        "model_trained":    False,
-        "pred_result":      None,
+        "vf_model":          None,
+        "model_trained":     False,
+        "pred_result":       None,
+        "loaded_filenames":  set(),   # tracks filenames already ingested this session
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -483,9 +482,15 @@ def _render_sidebar(db: VFDatabase) -> tuple[Optional[int], list[int], dict]:
 
 
 def _process_upload(db: VFDatabase, uploaded) -> None:
+    # Guard 1: fast in-memory check (avoids DB query on every Streamlit rerun)
+    if uploaded.name in st.session_state.loaded_filenames:
+        return
+
+    # Guard 2: DB-level check (handles page reload where session state is lost)
     sessions_df = db.get_sessions()
     if not sessions_df.empty and uploaded.name in sessions_df["filename"].values:
-        return  # already loaded — skip silently
+        st.session_state.loaded_filenames.add(uploaded.name)
+        return
 
     # Remember if the user already had a case open before this upload.
     # If yes, we preserve their selection after the upload completes.
@@ -513,6 +518,9 @@ def _process_upload(db: VFDatabase, uploaded) -> None:
                 # After that the user controls navigation themselves.
                 if not had_active:
                     st.session_state.active_session = sid
+
+                # Record as loaded so re-runs don't re-ingest
+                st.session_state.loaded_filenames.add(uploaded.name)
 
                 for w in warnings:
                     st.warning(w)
@@ -1047,10 +1055,12 @@ def _tab_distributions(meas_df: pd.DataFrame) -> None:
                 text_auto=".2f", aspect="auto",
             )
             fig_c.update_layout(
-                **CHART_BASE_SUB,
+                plot_bgcolor="white",
+                paper_bgcolor="white",
+                margin=dict(l=60, r=40, t=60, b=60),
                 height=460,
-                font=dict(size=13),
             )
+            fig_c.update_traces(textfont_size=12)
             st.plotly_chart(fig_c, use_container_width=True)
 
 
@@ -1368,15 +1378,18 @@ def _tab_cohort(
             points="outliers",
         )
         fig.update_layout(
-            **CHART_BASE_SUB,
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+            margin=dict(l=60, r=40, t=60, b=60),
             title=dict(text=f"{param_label} — Distribution per Case",
                        font=dict(size=16, color=C["primary"]), x=0),
-            xaxis=dict(title="", tickfont=dict(size=14)),
-            yaxis=dict(title=dict(text=y_lbl, font=dict(size=14)),
-                       tickfont=dict(size=13),
-                       showgrid=True, gridcolor=C["grid"]),
             height=360,
             showlegend=False,
+        )
+        fig.update_xaxes(title_text="", tickfont=dict(size=14), showgrid=False)
+        fig.update_yaxes(
+            title_text=y_lbl, title_font=dict(size=14),
+            tickfont=dict(size=13), showgrid=True, gridcolor=C["grid"],
         )
         st.plotly_chart(fig, use_container_width=True)
 

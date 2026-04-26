@@ -51,35 +51,35 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 C = {
-    # Brand
-    "primary":    "#1B4F72",   # navy — headings, strong text
-    "accent":     "#2E86C1",   # mid-blue — all measurement lines
-    "accent_fill":"rgba(46,134,193,0.10)",
+    # Brand — MC3 VitalFlow™ device colour language
+    "primary":    "#1C1C1E",   # near-black housing
+    "accent":     "#00BCD4",   # cyan (screen metric colour)
+    "accent_fill":"rgba(0,188,212,0.10)",
 
     # Semantic
-    "alarm":      "#C0392B",   # red — alarms ONLY
-    "alarm_fill": "rgba(192,57,43,0.10)",
-    "warn":       "#CA6F1E",   # amber — moderate risk / warnings
-    "ok":         "#1E8449",   # green — normal / no-alarm
+    "alarm":      "#FF3B30",   # device alarm red
+    "alarm_fill": "rgba(255,59,48,0.10)",
+    "warn":       "#FF9500",   # amber warning
+    "ok":         "#00C853",   # device green (status bar)
 
     # Layout
-    "subtle":     "#7F8C8D",   # grey — secondary text
-    "grid":       "#EDF0F2",   # very light — chart gridlines
-    "border":     "#D5D8DC",   # card borders
-    "bg_card":    "#F8F9FA",   # card backgrounds
+    "subtle":     "#546E7A",   # blue-grey secondary text
+    "grid":       "#ECEFF1",   # very light blue-grey gridlines
+    "border":     "#CFD8DC",   # cool grey borders
+    "bg_card":    "#F5F7F8",   # off-white card bg
 }
 
 # Distinct colours for multi-session overlays — blue first, then diverging
-SESSION_COLORS = ["#2E86C1", "#1E8449", "#8E44AD", "#CA6F1E", "#C0392B"]
+SESSION_COLORS = ["#00BCD4", "#00C853", "#7C4DFF", "#FF9500", "#FF3B30"]
 
 # Shared chart layout — applied to every figure via _base_fig()
 # Larger fonts, more breathing room, clean white background
-CHART_FONT = dict(family="'Segoe UI', Arial, sans-serif", size=14, color=C["primary"])
+CHART_FONT = dict(family="'Inter', 'DM Sans', 'Segoe UI', Arial, sans-serif", size=14, color=C["primary"])
 CHART_BASE = dict(
     plot_bgcolor="white",
     paper_bgcolor="white",
     font=CHART_FONT,
-    title_font=dict(family="'Segoe UI', Arial, sans-serif", size=16, color=C["primary"]),
+    title_font=dict(family="'Inter', 'DM Sans', 'Segoe UI', Arial, sans-serif", size=16, color=C["primary"]),
     margin=dict(l=60, r=40, t=60, b=60),
     legend=dict(
         orientation="h",
@@ -123,9 +123,11 @@ DEFAULT_TREND_PARAMS = ["flow_rate_lpm", "pressure_delta_mmhg", "sat_pre_pct", "
 def _inject_css() -> None:
     st.markdown(f"""
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&display=swap');
+
 /* Global typography */
 html, body, [class*="css"] {{
-    font-family: 'Segoe UI', Arial, sans-serif;
+    font-family: 'Inter', 'DM Sans', 'Segoe UI', Arial, sans-serif;
     font-size: 15px;
 }}
 
@@ -154,7 +156,7 @@ section[data-testid="stSidebar"] .stSelectbox label {{
     transition: background 0.15s;
 }}
 .stTabs [aria-selected="true"] {{
-    background: #EAF2FB; color: {C['primary']} !important;
+    background: #E0F7FA; color: {C['primary']} !important;
     font-weight: 700; border-bottom: 3px solid {C['accent']};
 }}
 
@@ -185,7 +187,7 @@ div[data-testid="metric-container"] [data-testid="stMetricDelta"] {{
 
 /* ── Case header card ── */
 .case-header {{
-    background: linear-gradient(135deg, {C['primary']} 0%, #2471A3 100%);
+    background: linear-gradient(135deg, {C['primary']} 0%, #00BCD4 100%);
     border-radius: 14px;
     padding: 20px 28px;
     margin-bottom: 24px;
@@ -240,7 +242,7 @@ div[data-testid="metric-container"] [data-testid="stMetricDelta"] {{
 
 /* ── Chart interpretation note ── */
 .chart-note {{
-    background: #EBF5FB;
+    background: #E0F7FA;
     border-left: 4px solid {C['accent']};
     padding: 9px 14px;
     border-radius: 0 8px 8px 0;
@@ -387,7 +389,7 @@ def _render_sidebar(db: VFDatabase) -> tuple[Optional[int], list[int], dict]:
 <div style="text-align:center;padding:18px 0 10px;">
   <span style="font-size:2.2rem;">🫀</span><br>
   <span style="font-size:1.2rem;font-weight:700;letter-spacing:.08em;">VF ANALYST</span><br>
-  <span style="font-size:.70rem;opacity:.55;letter-spacing:.10em;">ECMO · PERFUSION · VAD</span>
+  <span style="font-size:.70rem;opacity:.55;letter-spacing:.10em;color:#00BCD4;">ECMO · PERFUSION · VAD</span>
 </div>""", unsafe_allow_html=True)
         st.divider()
 
@@ -539,12 +541,12 @@ def _render_landing() -> None:
 <div style="max-width:600px;margin:80px auto;text-align:center;">
   <div style="font-size:3.2rem;margin-bottom:14px;">🫀</div>
   <h1 style="font-size:1.9rem;margin-bottom:8px;">VF Analyst</h1>
-  <p style="color:#7F8C8D;font-size:1rem;margin-bottom:36px;">
+  <p style="color:#546E7A;font-size:1rem;margin-bottom:36px;">
     Clinical dashboard for ECMO &amp; VAD perfusion monitoring
   </p>
-  <div style="background:#EAF2FB;border:1px solid #AED6F1;border-radius:14px;
+  <div style="background:#E0F7FA;border:1px solid #AED6F1;border-radius:14px;
               padding:26px 32px;text-align:left;">
-    <p style="font-weight:700;margin-bottom:10px;color:#1B4F72;">To get started:</p>
+    <p style="font-weight:700;margin-bottom:10px;color:#1C1C1E;">To get started:</p>
     <ol style="color:#2C3E50;line-height:2.2;font-size:.95rem;margin:0;">
       <li>Export the CSV log from the ECMO / VAD device via USB.</li>
       <li>Click <strong>Upload Examination Files</strong> in the left panel.</li>
@@ -552,7 +554,7 @@ def _render_landing() -> None:
     </ol>
   </div>
   <p style="color:#BDC3C7;font-size:.75rem;margin-top:28px;">
-    Compatible with Xenios · Maquet · Getinge device exports
+    Compatible with Medtronic · Xenios · Maquet · Getinge device exports
   </p>
 </div>""", unsafe_allow_html=True)
 

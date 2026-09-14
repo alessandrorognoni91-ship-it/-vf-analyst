@@ -32,6 +32,7 @@ from data_loader import load_csv
 from data_cleaning import clean, compute_summary
 from data_model import VFDatabase
 from ml_model import VFModel
+from clinical_rules import run_all_rules, SEVERITY_COLORS, RuleResult
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Page config
@@ -713,12 +714,13 @@ def _render_dashboard(
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
     (tab_ov, tab_tr, tab_dist,
-     tab_al, tab_cmp, tab_coh,
+     tab_al, tab_ew, tab_cmp, tab_coh,
      tab_risk, tab_audit) = st.tabs([
         "📋 Overview",
         "📈 Vital Trends",
         "📊 Distributions",
         "🚨 Alarms",
+        "⚕️ Early Warning",
         "⚖️ Comparison",
         "🏥 Cohort",
         "🧠 Risk Prediction",
@@ -729,6 +731,7 @@ def _render_dashboard(
     with tab_tr:    _tab_trends(meas_df, alarm_df)
     with tab_dist:  _tab_distributions(meas_df)
     with tab_al:    _tab_alarms(alarm_df, meas_df)
+    with tab_ew:    _tab_early_warning(meas_df)
     with tab_cmp:   _tab_compare(db, selected_ids, sessions_df)
     with tab_coh:   _tab_cohort(db, selected_ids, sessions_df)
     with tab_risk:  _tab_risk(db, selected_ids, active_id, sessions_df)
@@ -1431,6 +1434,219 @@ def _tab_cohort(
         if agg_rows:
             st.dataframe(pd.DataFrame(agg_rows).set_index("Parameter"),
                          use_container_width=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tab: Early Warning  (NEW — clinical rules from clinical_rules.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _tab_early_warning(meas_df: pd.DataFrame) -> None:
+    st.markdown("## ⚕️ Early Warning — Clinical Alert System")
+    st.caption(
+        "Evidence-based alert rules derived from published ECMO clinical guidelines. "
+        "Each rule fires when a parameter crosses a threshold validated in peer-reviewed literature. "
+        "This is a decision-support tool — all alerts must be interpreted by a qualified clinician."
+    )
+
+    if meas_df.empty:
+        st.warning("No measurement data available for this session.")
+        return
+
+    # ── Patient parameters (optional — improve SAVE score) ───────────────────
+    with st.expander("⚙️ Optional — Enter patient parameters to improve SAVE score", expanded=False):
+        st.caption(
+            "These are used only for the SAVE score estimate. "
+            "If left blank, the score is computed from device data only."
+        )
+        p1, p2 = st.columns(2)
+        with p1:
+            age       = st.number_input("Patient age (years)", min_value=0, max_value=120,
+                                         value=0, step=1, key="ew_age")
+            weight_kg = st.number_input("Weight (kg)", min_value=0, max_value=300,
+                                         value=0, step=1, key="ew_weight")
+        with p2:
+            acute_myocarditis    = st.checkbox("Indication: acute myocarditis", key="ew_myo")
+            vt_vf                = st.checkbox("Indication: refractory VT/VF", key="ew_vtvf")
+            post_cardiac_surgery = st.checkbox("Indication: post-cardiac surgery", key="ew_pcs")
+
+    save_kwargs = dict(
+        age=age if age > 0 else None,
+        weight_kg=weight_kg if weight_kg > 0 else None,
+        acute_myocarditis=acute_myocarditis,
+        vt_vf=vt_vf,
+        post_cardiac_surgery=post_cardiac_surgery,
+    )
+
+    # ── Run all rules ─────────────────────────────────────────────────────────
+    with st.spinner("Analysing session against clinical rules…"):
+        try:
+            enriched_df, summaries = run_all_rules(meas_df, save_kwargs=save_kwargs)
+        except Exception as exc:
+            st.error(f"Error running clinical rules: {exc}")
+            return
+
+    # ── Summary KPI row ───────────────────────────────────────────────────────
+    total_alerts = int(enriched_df["alert_any"].sum())
+    total_recs   = len(enriched_df)
+    n_critical   = sum(1 for s in summaries if s["severity"] == "CRITICAL" and s["events"] > 0)
+    n_high       = sum(1 for s in summaries if s["severity"] == "HIGH"     and s["events"] > 0)
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Total Alert Events",  f"{total_alerts:,}",
+              help="Number of time points where at least one clinical rule fired.")
+    k2.metric("Alert Coverage",
+              f"{total_alerts / max(total_recs,1) * 100:.1f}% of session")
+    k3.metric("Critical Rules Fired", str(n_critical),
+              delta="Review immediately" if n_critical > 0 else None,
+              delta_color="inverse" if n_critical > 0 else "off")
+    k4.metric("High Rules Fired", str(n_high))
+
+    st.markdown('<hr style="border:none;border-top:1px solid var(--border);margin:1rem 0">', unsafe_allow_html=True)
+
+    # ── Per-rule alert cards ──────────────────────────────────────────────────
+    st.markdown("### Rule-by-Rule Results")
+    _note(
+        "Each card shows one clinical alert rule. The bar indicates what "
+        "percentage of the session triggered that rule. "
+        "Rules with zero events are shown collapsed at the bottom."
+    )
+
+    SEVERITY_LABEL = {"CRITICAL": "🔴", "HIGH": "🟠", "MODERATE": "🟡", "LOW": "🔵"}
+    SEVERITY_SORT  = {"CRITICAL": 0, "HIGH": 1, "MODERATE": 2, "LOW": 3}
+
+    fired     = sorted([s for s in summaries if s["events"] > 0],
+                        key=lambda x: SEVERITY_SORT[x["severity"]])
+    not_fired = [s for s in summaries if s["events"] == 0]
+
+    for s in fired:
+        icon  = SEVERITY_LABEL.get(s["severity"], "⚪")
+        color = SEVERITY_COLORS.get(s["severity"], "#888")
+        pct   = s["rate_pct"]
+
+        with st.container():
+            h_col, v_col = st.columns([5, 1])
+            with h_col:
+                st.markdown(
+                    f"**{icon} {s['label']}** "
+                    f"<span style='font-size:.82rem;color:{color};font-weight:700;'>"
+                    f"{s['severity']}</span>",
+                    unsafe_allow_html=True,
+                )
+                st.progress(min(pct / 100, 1.0))
+                st.caption(
+                    f"{s['events']:,} events · {pct:.1f}% of session — "
+                    f"_{s['description']}_"
+                )
+                st.caption(f"📖 {s['reference']}")
+            with v_col:
+                st.metric(" ", f"{pct:.1f}%")
+        st.markdown("---")
+
+    if not_fired:
+        with st.expander(f"✅ {len(not_fired)} rules with no events (all clear)", expanded=False):
+            for s in not_fired:
+                icon = SEVERITY_LABEL.get(s["severity"], "⚪")
+                st.markdown(
+                    f"{icon} **{s['label']}** — "
+                    f"<span style='color:{C["ok"]};font-weight:600;'>No events detected</span>  "
+                    f"<span style='font-size:.80rem;color:{C["subtle"]};'>{s['description']}</span>",
+                    unsafe_allow_html=True,
+                )
+
+    st.markdown('<hr style="border:none;border-top:1px solid var(--border);margin:1rem 0">', unsafe_allow_html=True)
+
+    # ── Alert timeline overlay ────────────────────────────────────────────────
+    st.markdown("### Alert Timeline")
+    _note(
+        "Each coloured band shows when a specific rule was active. "
+        "Overlapping bands indicate multiple simultaneous alerts — the most critical periods to review."
+    )
+
+    if "timestamp" not in enriched_df.columns or enriched_df["timestamp"].isna().all():
+        st.warning("No timestamp data — timeline not available.")
+        return
+
+    alert_cols = [c for c in enriched_df.columns if c.startswith("alert_") and c != "alert_any"]
+    if not alert_cols:
+        st.info("No alert columns found.")
+        return
+
+    # Label map: alert_col → friendly name
+    col_to_label = {s["rule"]: s["label"] for s in summaries}
+    col_to_sev   = {s["rule"]: s["severity"] for s in summaries}
+
+    fig = _base_fig(
+        title="Clinical Alert Activity Over Time",
+        xaxis_title="Date / Time",
+        yaxis_title="Alert Level (0 = off, 1 = active)",
+        height=60 + 80 * len(alert_cols),
+    )
+
+    rows_with_data = [c for c in alert_cols if enriched_df[c].sum() > 0]
+    colors_cycle   = [C["alarm"], C["warn"], "#8E44AD", C["accent"], "#00BCD4", "#1E8449"]
+
+    for i, col in enumerate(rows_with_data):
+        rule_name = col.replace("alert_", "")
+        label     = col_to_label.get(rule_name, col)
+        color     = colors_cycle[i % len(colors_cycle)]
+        fig.add_trace(go.Scatter(
+            x=enriched_df["timestamp"],
+            y=enriched_df[col].astype(float),
+            mode="lines",
+            name=label,
+            line=dict(width=2, color=color),
+            fill="tozeroy",
+            fillcolor=color.replace(")", ",0.12)").replace("rgb", "rgba")
+                if color.startswith("rgb")
+                else color + "1E",
+        ))
+
+    fig.update_layout(
+        **CHART_BASE_SUB,
+        legend=dict(orientation="h", y=-0.22, x=0, font=dict(size=12)),
+        yaxis=dict(range=[-0.05, 1.3], tickvals=[0, 1],
+                   ticktext=["Off", "Active"], tickfont=dict(size=12)),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── SAVE score section ────────────────────────────────────────────────────
+    st.markdown("### SAVE Score Estimate")
+    _note(
+        "The SAVE score (Schmidt et al., Eur Heart J 2015) estimates survival probability "
+        "in VA-ECMO patients. This is a partial calculation using only device-observable "
+        "parameters. Laboratory values (lactate, creatinine) are not included."
+    )
+
+    if "save_risk_level" in enriched_df.columns:
+        save_score   = enriched_df["save_score_partial"].median()
+        save_level   = enriched_df["save_risk_level"].mode()[0]
+        save_surv    = enriched_df["save_survival_est"].mode()[0]
+        save_note    = enriched_df["save_note"].iloc[0]
+
+        sc1, sc2, sc3 = st.columns(3)
+        sc1.metric("Partial SAVE Score (median)", f"{save_score:.1f}",
+                   help="Computed from device-observable parameters only.")
+        sc2.metric("Risk Level", save_level)
+        sc3.metric("Estimated Survival", save_surv,
+                   help="From Schmidt et al. Eur Heart J 2015 — full validated SAVE score.")
+
+        with st.expander("⚠️ Important note on the SAVE score", expanded=False):
+            st.warning(save_note)
+            st.markdown(
+                "Full validated calculator: "
+                "[www.save-score.com](https://www.save-score.com)"
+            )
+
+    # ── Full enriched data (advanced) ─────────────────────────────────────────
+    with st.expander("📋 Full alert data table (Advanced)", expanded=False):
+        st.caption("Raw output of all clinical rule columns merged with measurements.")
+        show_cols = (
+            ["timestamp"] +
+            [c for c in enriched_df.columns if c.startswith("alert_")] +
+            ["save_score_partial", "save_risk_level"]
+        )
+        show_cols = [c for c in show_cols if c in enriched_df.columns]
+        st.dataframe(enriched_df[show_cols], use_container_width=True, height=320)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

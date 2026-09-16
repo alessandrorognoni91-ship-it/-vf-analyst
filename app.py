@@ -380,6 +380,7 @@ def _init_state() -> None:
         "loaded_filenames":  set(),   # tracks filenames already ingested this session
         "live_mode":         False,   # True when live TCP or simulation is active
         "live_session_id":   None,    # session_id of the active live stream
+        "app_mode":          None,    # "csv" | "live" | None (not chosen yet)
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -544,26 +545,95 @@ def _process_upload(db: VFDatabase, uploaded) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _render_landing() -> None:
+    """
+    Mode-picker home screen.
+    The user chooses CSV upload or Live streaming before anything else loads.
+    The choice is stored in st.session_state.app_mode and persists for the
+    entire browser session — the user can reset it from the sidebar.
+    """
+    # ── Branding header ───────────────────────────────────────────────────────
     st.markdown("""
-<div style="max-width:600px;margin:80px auto;text-align:center;">
-  <div style="font-size:3.2rem;margin-bottom:14px;">🫀</div>
-  <h1 style="font-size:1.9rem;margin-bottom:8px;">VF Analyst</h1>
-  <p style="color:#546E7A;font-size:1rem;margin-bottom:36px;">
-    Clinical dashboard for ECMO &amp; VAD perfusion monitoring
-  </p>
-  <div style="background:#E0F7FA;border:1px solid #AED6F1;border-radius:14px;
-              padding:26px 32px;text-align:left;">
-    <p style="font-weight:700;margin-bottom:10px;color:#1C1C1E;">To get started:</p>
-    <ol style="color:#2C3E50;line-height:2.2;font-size:.95rem;margin:0;">
-      <li>Export the CSV log from the ECMO / VAD device via USB.</li>
-      <li>Click <strong>Upload Examination Files</strong> in the left panel.</li>
-      <li>You can load <strong>multiple cases</strong> to enable comparison.</li>
-    </ol>
+<div style="text-align:center;padding:48px 0 32px;">
+  <div style="font-size:3rem;margin-bottom:10px;">🫀</div>
+  <div style="font-size:2rem;font-weight:700;color:#1C1C1E;letter-spacing:-.01em;">
+    VF Analyst
   </div>
-  <p style="color:#BDC3C7;font-size:.75rem;margin-top:28px;">
-    Compatible with Medtronic · Xenios · Maquet · Getinge device exports
-  </p>
+  <div style="font-size:1rem;color:#546E7A;margin-top:6px;">
+    Clinical dashboard for ECMO &amp; VAD perfusion monitoring
+  </div>
 </div>""", unsafe_allow_html=True)
+
+    # ── Mode selection cards ───────────────────────────────────────────────────
+    st.markdown(
+        "<h2 style='text-align:center;font-size:1.15rem;color:#546E7A;"
+        "font-weight:500;margin-bottom:24px;border:none;'>"
+        "How would you like to work today?</h2>",
+        unsafe_allow_html=True,
+    )
+
+    col_csv, col_gap, col_live = st.columns([5, 1, 5])
+
+    # ── Card: CSV / USB ───────────────────────────────────────────────────────
+    with col_csv:
+        st.markdown("""
+<div style="border:1.5px solid #CBD3DA;border-radius:16px;padding:28px 28px 20px;
+            background:#F5F7F8;height:100%;min-height:300px;">
+  <div style="font-size:2.4rem;margin-bottom:12px;">📂</div>
+  <div style="font-size:1.15rem;font-weight:700;color:#1C1C1E;margin-bottom:8px;">
+    Upload CSV File
+  </div>
+  <div style="font-size:.9rem;color:#546E7A;line-height:1.7;margin-bottom:20px;">
+    Analyse a session log exported from the ECMO device via USB stick.
+    Supports multiple files, case comparison, cohort analysis,
+    and retrospective risk prediction.
+  </div>
+  <div style="font-size:.82rem;color:#00897B;font-weight:600;">
+    ✓ Full retrospective analysis<br>
+    ✓ Multi-case comparison<br>
+    ✓ Works without the device connected<br>
+    ✓ USB auto-ingestion on Raspberry Pi
+  </div>
+</div>""", unsafe_allow_html=True)
+        st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+        if st.button("📂 Open CSV Mode", use_container_width=True,
+                     type="primary", key="btn_csv"):
+            st.session_state.app_mode = "csv"
+            st.rerun()
+
+    # ── Card: Live / RJ45 ─────────────────────────────────────────────────────
+    with col_live:
+        st.markdown("""
+<div style="border:1.5px solid #00BCD4;border-radius:16px;padding:28px 28px 20px;
+            background:#E0F7FA;height:100%;min-height:300px;">
+  <div style="font-size:2.4rem;margin-bottom:12px;">📡</div>
+  <div style="font-size:1.15rem;font-weight:700;color:#1C1C1E;margin-bottom:8px;">
+    Live Monitoring
+  </div>
+  <div style="font-size:.9rem;color:#546E7A;line-height:1.7;margin-bottom:20px;">
+    Connect to the VitalFlow device via RJ45 and monitor data in real time.
+    Clinical alerts fire automatically as data arrives.
+    Also supports simulation mode for demo without a device.
+  </div>
+  <div style="font-size:.82rem;color:#00897B;font-weight:600;">
+    ✓ Real-time clinical alerts<br>
+    ✓ Live trends on second monitor<br>
+    ✓ Simulation mode (no device needed)<br>
+    ✓ Auto-reconnect on network loss
+  </div>
+</div>""", unsafe_allow_html=True)
+        st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+        if st.button("📡 Open Live Mode", use_container_width=True,
+                     type="secondary", key="btn_live"):
+            st.session_state.app_mode = "live"
+            st.rerun()
+
+    # ── Footer ────────────────────────────────────────────────────────────────
+    st.markdown(
+        "<p style='text-align:center;color:#BDC3C7;font-size:.75rem;margin-top:36px;'>"
+        "Compatible with Medtronic · Xenios · Maquet · Getinge device exports"
+        "</p>",
+        unsafe_allow_html=True,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -744,6 +814,50 @@ def _render_dashboard(
     with tab_coh:   _tab_cohort(db, selected_ids, sessions_df)
     with tab_risk:  _tab_risk(db, selected_ids, active_id, sessions_df)
     with tab_audit: _tab_audit(db, active_id)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Live mode: dedicated sidebar + full-screen live page
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _render_sidebar_live(db: VFDatabase) -> None:
+    """Minimal sidebar for Live mode — connection controls only."""
+    with st.sidebar:
+        st.markdown("""
+<div style="text-align:center;padding:16px 0 8px;">
+  <span style="font-size:2rem;">📡</span><br>
+  <span style="font-size:1.1rem;font-weight:700;letter-spacing:.06em;">LIVE MODE</span><br>
+  <span style="font-size:.70rem;opacity:.55;letter-spacing:.08em;">MEDTRONIC · ECMO · VAD</span>
+</div>""", unsafe_allow_html=True)
+        st.divider()
+
+        buf = get_live_buffer()
+        if buf:
+            st.success(f"● Stream active — {buf.row_count:,} records")
+        else:
+            st.info("Stream not started yet.")
+
+        st.divider()
+        st.caption("Use the main panel to start or stop the live stream.")
+
+
+def _render_live_page(db: VFDatabase) -> None:
+    """
+    Dedicated full-page live monitoring view.
+    Shown when the user selects Live mode from the home screen.
+    Wraps _tab_live_monitor() with a page header.
+    """
+    st.markdown("""
+<div style="display:flex;align-items:center;gap:14px;padding:4px 0 20px;
+            border-bottom:2px solid #CBD3DA;margin-bottom:20px;">
+  <span style="font-size:1.6rem;">📡</span>
+  <div>
+    <div style="font-size:1.4rem;font-weight:700;color:#1C1C1E;">Live Monitor</div>
+    <div style="font-size:.85rem;color:#546E7A;">Real-time data from VitalFlow device via RJ45</div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+    _tab_live_monitor(db)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2235,10 +2349,46 @@ def main() -> None:
     _inject_css()
     _init_state()
     db = st.session_state.db
+
+    app_mode = st.session_state.get("app_mode")  # "csv" | "live" | None
+
+    # ── No mode chosen yet → show mode picker ────────────────────────────────
+    if app_mode is None:
+        _render_landing()
+        return
+
+    # ── Sidebar: add a "Change mode" button at the bottom ────────────────────
+    with st.sidebar:
+        st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+        if st.button("⟵ Change mode", use_container_width=True,
+                     key="btn_change_mode",
+                     help="Return to the home screen to switch between CSV and Live"):
+            st.session_state.app_mode = None
+            # Reset live session but keep loaded CSV sessions
+            st.session_state.live_mode = False
+            st.rerun()
+
+    # ── Route to correct entry point ──────────────────────────────────────────
+    if app_mode == "live":
+        # Live mode: sidebar only shows minimal controls, main content = live tab
+        _render_sidebar_live(db)
+        _render_live_page(db)
+        return
+
+    # CSV mode: full sidebar + dashboard
     active_id, selected_ids, filters = _render_sidebar(db)
 
     if active_id is None:
-        _render_landing()
+        # CSV mode but no file loaded yet — show upload prompt
+        st.markdown("""
+<div style="max-width:520px;margin:60px auto;text-align:center;">
+  <div style="font-size:2.5rem;margin-bottom:12px;">📂</div>
+  <h2 style="font-size:1.3rem;margin-bottom:8px;">No files loaded yet</h2>
+  <p style="color:#546E7A;font-size:.95rem;">
+    Use the <strong>Upload Examination Files</strong> panel on the left
+    to load one or more CSV files from the ECMO device.
+  </p>
+</div>""", unsafe_allow_html=True)
         return
 
     _render_dashboard(db, active_id, selected_ids, filters)

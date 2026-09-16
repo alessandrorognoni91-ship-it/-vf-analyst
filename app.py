@@ -33,6 +33,10 @@ from data_cleaning import clean, compute_summary
 from data_model import VFDatabase
 from ml_model import VFModel
 from clinical_rules import run_all_rules, SEVERITY_COLORS, RuleResult
+from data_receiver import (
+    start_live_receiver, start_simulated_receiver, start_usb_watcher,
+    get_live_buffer, get_usb_watcher, LiveBuffer,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Page config
@@ -374,6 +378,8 @@ def _init_state() -> None:
         "model_trained":     False,
         "pred_result":       None,
         "loaded_filenames":  set(),   # tracks filenames already ingested this session
+        "live_mode":         False,   # True when live TCP or simulation is active
+        "live_session_id":   None,    # session_id of the active live stream
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -713,9 +719,10 @@ def _render_dashboard(
     _render_case_header(meas_df, srow, alarm_count)
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
-    (tab_ov, tab_tr, tab_dist,
+    (tab_live, tab_ov, tab_tr, tab_dist,
      tab_al, tab_ew, tab_cmp, tab_coh,
      tab_risk, tab_audit) = st.tabs([
+        "📡 Live Monitor",
         "📋 Overview",
         "📈 Vital Trends",
         "📊 Distributions",
@@ -727,6 +734,7 @@ def _render_dashboard(
         "🔍 Data Audit",
     ])
 
+    with tab_live:  _tab_live_monitor(db)
     with tab_ov:    _tab_overview(meas_df, alarm_df)
     with tab_tr:    _tab_trends(meas_df, alarm_df)
     with tab_dist:  _tab_distributions(meas_df)
@@ -736,6 +744,224 @@ def _render_dashboard(
     with tab_coh:   _tab_cohort(db, selected_ids, sessions_df)
     with tab_risk:  _tab_risk(db, selected_ids, active_id, sessions_df)
     with tab_audit: _tab_audit(db, active_id)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tab: Live Monitor  (NEW — real-time data via TCP/RJ45 or simulation)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _tab_live_monitor(db: VFDatabase) -> None:
+    """
+    Real-time monitoring panel.
+    Shows live measurements and clinical alerts with auto-refresh.
+    Supports three modes:
+      - TCP Live: connects to VitalFlow device via RJ45
+      - Simulated: generates realistic demo data (no device needed)
+      - USB Auto: shows status of the USB directory watcher
+    """
+    st.markdown("## 📡 Live Monitor")
+
+    # ── Connection controls ───────────────────────────────────────────────────
+    ctrl1, ctrl2, ctrl3 = st.columns([2, 2, 3])
+
+    with ctrl1:
+        mode = st.radio(
+            "Data source",
+            options=["simulation", "tcp_live"],
+            format_func=lambda x: "🟢 Simulation (demo)" if x == "simulation"
+                                   else "🔵 VitalFlow device (RJ45)",
+            key="live_mode_select",
+        )
+
+    with ctrl2:
+        if mode == "tcp_live":
+            device_ip   = st.text_input("Device IP address", value="192.168.1.100",
+                                         key="device_ip")
+            device_port = st.number_input("Port", value=8080, min_value=1,
+                                           max_value=65535, key="device_port")
+        else:
+            st.info("Simulation mode — no device needed.")
+            device_ip   = "127.0.0.1"
+            device_port = 0
+
+    with ctrl3:
+        buf = get_live_buffer()
+        is_running = buf is not None
+
+        if not is_running:
+            if st.button("▶ Start Live Stream", type="primary",
+                          use_container_width=True, key="start_live"):
+                with st.spinner("Connecting…"):
+                    if mode == "simulation":
+                        buf, rcv = start_simulated_receiver(db)
+                        st.session_state.live_mode = True
+                        st.success("✅ Simulated stream started.")
+                    else:
+                        try:
+                            buf, rcv = start_live_receiver(
+                                db, host=device_ip, port=int(device_port)
+                            )
+                            st.session_state.live_mode = True
+                            st.success(f"✅ Connecting to {device_ip}:{device_port}…")
+                        except Exception as exc:
+                            st.error(f"Connection failed: {exc}")
+                            return
+                st.rerun()
+        else:
+            st.metric("Live buffer", f"{buf.row_count:,} rows")
+            st.caption("Stream active — refreshes every 3 seconds.")
+
+    if not is_running:
+        st.info("Start the live stream above to see real-time data.")
+
+        # ── USB watcher status ───────────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("### 🔌 USB Auto-Watcher")
+        _note(
+            "Drop a CSV file in the watched folder and it will be ingested "
+            "automatically — no upload button needed. "
+            "On Raspberry Pi this folder is /media/usb (where USB sticks mount)."
+        )
+        usb = get_usb_watcher()
+        if usb and usb.is_alive():
+            st.success(
+                f"✅ USB watcher active — monitoring `{usb.watch_dir}` "
+                f"· {usb.files_ingested} file(s) auto-ingested"
+            )
+            if usb.last_error:
+                st.warning(f"Last error: {usb.last_error}")
+        else:
+            st.warning(
+                "USB watcher not running. "
+                "Start the app with `USB_WATCH_DIR=/media/usb streamlit run app.py` "
+                "to enable auto-ingestion on Raspberry Pi."
+            )
+        return
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Live data display
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # Auto-refresh every 3 seconds using Streamlit's fragment mechanism
+    refresh_interval = st.slider(
+        "Refresh interval (seconds)", min_value=1, max_value=10, value=3,
+        key="live_refresh",
+    )
+    st.markdown(
+        f'<meta http-equiv="refresh" content="{refresh_interval}">',
+        unsafe_allow_html=True,
+    )
+
+    live_df = buf.get_dataframe(last_n=300)
+    if live_df.empty:
+        st.info("Waiting for first data packet…")
+        return
+
+    # ── Live KPIs ─────────────────────────────────────────────────────────────
+    last = live_df.iloc[-1]
+
+    st.markdown("### Current Measurements")
+    k = st.columns(4)
+
+    def _live_metric(col_widget, label, col_name, unit, fmt=".2f"):
+        val = last.get(col_name)
+        if pd.notna(val):
+            col_widget.metric(label, f"{val:{fmt}} {unit}")
+        else:
+            col_widget.metric(label, "—")
+
+    _live_metric(k[0], "Blood Flow",    "flow_rate_lpm",       "L/min")
+    _live_metric(k[1], "ΔPressure",     "pressure_delta_mmhg", "mmHg", ".1f")
+    _live_metric(k[2], "Pre-oxy SatO₂", "sat_pre_pct",         "%",    ".1f")
+    _live_metric(k[3], "Pump Speed",    "pump_speed_rpm",      "RPM",  ".0f")
+
+    st.markdown('<hr style="margin:0.75rem 0">', unsafe_allow_html=True)
+
+    # ── Real-time clinical alerts ──────────────────────────────────────────────
+    st.markdown("### ⚕️ Active Clinical Alerts")
+    _note(
+        "Alerts are computed in real time from the last 300 data points "
+        "using the same evidence-based rules as the Early Warning tab."
+    )
+
+    try:
+        _, summaries = run_all_rules(live_df)
+        active = [s for s in summaries if s["events"] > 0]
+
+        if not active:
+            st.success("✅ All parameters within normal limits — no active alerts.")
+        else:
+            SEV_ICON = {"CRITICAL": "🔴", "HIGH": "🟠", "MODERATE": "🟡", "LOW": "🔵"}
+            for s in sorted(active, key=lambda x: {"CRITICAL":0,"HIGH":1,"MODERATE":2,"LOW":3}[x["severity"]]):
+                color = SEVERITY_COLORS.get(s["severity"], "#888")
+                st.markdown(
+                    f"**{SEV_ICON.get(s['severity'],'')} {s['label']}** — "
+                    f"<span style='color:{color};font-weight:700'>{s['severity']}</span>  "
+                    f"<span style='font-size:.85rem;color:var(--text-secondary)'>"
+                    f"{s['events']} events ({s['rate_pct']:.1f}%) — "
+                    f"{s['description']}</span>",
+                    unsafe_allow_html=True,
+                )
+    except Exception as exc:
+        st.warning(f"Alert engine error: {exc}")
+
+    st.markdown('<hr style="margin:0.75rem 0">', unsafe_allow_html=True)
+
+    # ── Live trend chart ──────────────────────────────────────────────────────
+    st.markdown("### Live Trends — Last 5 minutes")
+    _note(
+        "Rolling view of the last 300 readings. "
+        "Red markers indicate active alarm conditions."
+    )
+
+    available = [c for c in ["flow_rate_lpm","pressure_delta_mmhg","sat_pre_pct","pump_speed_rpm"]
+                 if c in live_df.columns and live_df[c].notna().any()]
+
+    if available and "timestamp" in live_df.columns:
+        n_show = min(4, len(available))
+        show   = available[:n_show]
+
+        fig = make_subplots(
+            rows=n_show, cols=1, shared_xaxes=True,
+            subplot_titles=[YAXIS_LABELS.get(c, DISPLAY_LABELS.get(c, c)) for c in show],
+            vertical_spacing=max(0.06, 0.12 / n_show),
+        )
+        for ann in fig.layout.annotations:
+            ann.font = dict(size=14, color=C["primary"])
+            ann.x = 0; ann.xanchor = "left"
+
+        for i, col in enumerate(show, 1):
+            _measurement_trace(fig, live_df["timestamp"], live_df[col],
+                               name=DISPLAY_LABELS.get(col, col), row=i, col=1)
+            if "alarm_active" in live_df.columns:
+                alm = live_df[live_df["alarm_active"] == 1]
+                if not alm.empty:
+                    _alarm_trace(fig, alm["timestamp"], alm[col],
+                                 show_legend=(i == 1), row=i, col=1)
+            fig.update_yaxes(
+                title_text=YAXIS_LABELS.get(col, ""),
+                title_font=dict(size=12),
+                showgrid=True, gridcolor=C["grid"],
+                row=i, col=1,
+            )
+
+        fig.update_layout(
+            **CHART_BASE_SUB,
+            height=max(260, 200 * n_show),
+            legend=dict(orientation="h", y=-0.1, x=0, font=dict(size=12)),
+        )
+        fig.update_xaxes(showgrid=True, gridcolor=C["grid"], tickfont=dict(size=12))
+        fig.update_xaxes(title_text="Time", title_font=dict(size=13), row=n_show, col=1)
+        st.plotly_chart(fig, use_container_width=True)
+
+    # ── USB watcher status (compact) ──────────────────────────────────────────
+    usb = get_usb_watcher()
+    if usb and usb.is_alive():
+        with st.expander(f"🔌 USB watcher active — {usb.files_ingested} file(s) ingested", expanded=False):
+            st.caption(f"Watching: `{usb.watch_dir}`")
+            if usb.last_error:
+                st.warning(f"Last error: {usb.last_error}")
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────

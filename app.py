@@ -487,6 +487,13 @@ def _render_sidebar(db: VFDatabase) -> tuple[Optional[int], list[int], dict]:
             f'📁 {len(all_ids)} case(s) loaded</div>',
             unsafe_allow_html=True,
         )
+        st.divider()
+        if st.button("⟵ Change mode", use_container_width=True,
+                     key="btn_change_mode_csv",
+                     help="Return to home screen to switch to Live mode"):
+            st.session_state.app_mode  = None
+            st.session_state.live_mode = False
+            st.rerun()
 
     return active_id, selected_ids, filters
 
@@ -789,10 +796,9 @@ def _render_dashboard(
     _render_case_header(meas_df, srow, alarm_count)
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
-    (tab_live, tab_ov, tab_tr, tab_dist,
+    (tab_ov, tab_tr, tab_dist,
      tab_al, tab_ew, tab_cmp, tab_coh,
      tab_risk, tab_audit) = st.tabs([
-        "📡 Live Monitor",
         "📋 Overview",
         "📈 Vital Trends",
         "📊 Distributions",
@@ -804,7 +810,6 @@ def _render_dashboard(
         "🔍 Data Audit",
     ])
 
-    with tab_live:  _tab_live_monitor(db)
     with tab_ov:    _tab_overview(meas_df, alarm_df)
     with tab_tr:    _tab_trends(meas_df, alarm_df)
     with tab_dist:  _tab_distributions(meas_df)
@@ -838,7 +843,14 @@ def _render_sidebar_live(db: VFDatabase) -> None:
             st.info("Stream not started yet.")
 
         st.divider()
-        st.caption("Use the main panel to start or stop the live stream.")
+        st.caption("Use the main panel to configure the connection.")
+        st.divider()
+        if st.button("⟵ Change mode", use_container_width=True,
+                     key="btn_change_mode_live",
+                     help="Return to home screen"):
+            st.session_state.app_mode  = None
+            st.session_state.live_mode = False
+            st.rerun()
 
 
 def _render_live_page(db: VFDatabase) -> None:
@@ -866,219 +878,254 @@ def _render_live_page(db: VFDatabase) -> None:
 
 def _tab_live_monitor(db: VFDatabase) -> None:
     """
-    Real-time monitoring panel.
-    Shows live measurements and clinical alerts with auto-refresh.
-    Supports three modes:
-      - TCP Live: connects to VitalFlow device via RJ45
-      - Simulated: generates realistic demo data (no device needed)
-      - USB Auto: shows status of the USB directory watcher
+    Full live monitoring page.
+    TCP/IP mode: connects to VitalFlow device via RJ45.
+    Simulation mode: realistic ECMO data stream (no device needed).
+    Includes step-by-step connection wizard and cable-check diagnostics.
     """
-    st.markdown("## 📡 Live Monitor")
+    import time as _time
 
-    # ── Connection controls ───────────────────────────────────────────────────
-    ctrl1, ctrl2, ctrl3 = st.columns([2, 2, 3])
-
-    with ctrl1:
-        mode = st.radio(
-            "Data source",
-            options=["simulation", "tcp_live"],
-            format_func=lambda x: "🟢 Simulation (demo)" if x == "simulation"
-                                   else "🔵 VitalFlow device (RJ45)",
-            key="live_mode_select",
-        )
-
-    with ctrl2:
-        if mode == "tcp_live":
-            device_ip   = st.text_input("Device IP address", value="192.168.1.100",
-                                         key="device_ip")
-            device_port = st.number_input("Port", value=8080, min_value=1,
-                                           max_value=65535, key="device_port")
-        else:
-            st.info("Simulation mode — no device needed.")
-            device_ip   = "127.0.0.1"
-            device_port = 0
-
-    with ctrl3:
-        buf = get_live_buffer()
-        is_running = buf is not None
-
-        if not is_running:
-            if st.button("▶ Start Live Stream", type="primary",
-                          use_container_width=True, key="start_live"):
-                with st.spinner("Connecting…"):
-                    if mode == "simulation":
-                        buf, rcv = start_simulated_receiver(db)
-                        st.session_state.live_mode = True
-                        st.success("✅ Simulated stream started.")
-                    else:
-                        try:
-                            buf, rcv = start_live_receiver(
-                                db, host=device_ip, port=int(device_port)
-                            )
-                            st.session_state.live_mode = True
-                            st.success(f"✅ Connecting to {device_ip}:{device_port}…")
-                        except Exception as exc:
-                            st.error(f"Connection failed: {exc}")
-                            return
-                st.rerun()
-        else:
-            st.metric("Live buffer", f"{buf.row_count:,} rows")
-            st.caption("Stream active — refreshes every 3 seconds.")
+    buf        = get_live_buffer()
+    is_running = buf is not None
 
     if not is_running:
-        st.info("Start the live stream above to see real-time data.")
+        # ── Connection setup wizard ───────────────────────────────────────────
+        st.markdown("### Connection Setup")
 
-        # ── USB watcher status ───────────────────────────────────────────────
-        st.markdown("---")
-        st.markdown("### 🔌 USB Auto-Watcher")
-        _note(
-            "Drop a CSV file in the watched folder and it will be ingested "
-            "automatically — no upload button needed. "
-            "On Raspberry Pi this folder is /media/usb (where USB sticks mount)."
+        mode = st.radio(
+            "Select data source",
+            options=["simulation", "tcp_live"],
+            format_func=lambda x: "🟢 Simulation mode (demo — no device needed)"
+                                   if x == "simulation"
+                                   else "🔵 VitalFlow device via RJ45 cable",
+            horizontal=True,
+            key="live_src_radio",
         )
-        usb = get_usb_watcher()
-        if usb and usb.is_alive():
-            st.success(
-                f"✅ USB watcher active — monitoring `{usb.watch_dir}` "
-                f"· {usb.files_ingested} file(s) auto-ingested"
-            )
-            if usb.last_error:
-                st.warning(f"Last error: {usb.last_error}")
+
+        if mode == "tcp_live":
+            st.markdown("#### Before connecting — follow these steps")
+            st.markdown("""
+<div style="background:#FFF8E1;border:1px solid #FFD54F;border-radius:10px;
+            padding:16px 20px;margin-bottom:16px;">
+  <div style="font-weight:600;color:#5D4037;margin-bottom:10px;">
+    🔌 Physical connection checklist
+  </div>
+  <ol style="color:#4E342E;line-height:2.2;margin:0;font-size:.93rem;">
+    <li>Take the <strong>RJ45 Ethernet cable</strong> (standard network cable).</li>
+    <li>Plug one end into the <strong>VitalFlow MC3 data port</strong>
+        (labelled "LAN" or "ETH" on the rear panel).</li>
+    <li>Plug the other end into your <strong>Raspberry Pi / computer</strong>
+        network port or a network switch.</li>
+    <li>Make sure both devices are on the <strong>same network</strong>.</li>
+    <li>Verify the <strong>link LED</strong> on both ends is green or amber.</li>
+  </ol>
+</div>""", unsafe_allow_html=True)
+
+            col_ip, col_port = st.columns([3, 1])
+            with col_ip:
+                device_ip = st.text_input(
+                    "VitalFlow IP address",
+                    value=st.session_state.get("last_device_ip", "192.168.1.100"),
+                    placeholder="e.g. 192.168.1.100",
+                    key="live_ip_input",
+                    help="Find this in the VitalFlow network settings menu.",
+                )
+            with col_port:
+                device_port = st.number_input(
+                    "Port", value=8080, min_value=1, max_value=65535,
+                    key="live_port_input",
+                    help="Default: 8080. Check VitalFlow documentation.",
+                )
         else:
-            st.warning(
-                "USB watcher not running. "
-                "Start the app with `USB_WATCH_DIR=/media/usb streamlit run app.py` "
-                "to enable auto-ingestion on Raspberry Pi."
+            device_ip, device_port = "127.0.0.1", 0
+            st.info(
+                "Simulation mode generates realistic ECMO data at 1 reading/second. "
+                "A gradual pressure rise will trigger the oxygenator thrombosis alert "
+                "after ~20 minutes — ideal for testing alerts without a real device."
             )
+
+        # ── Show last connection error ─────────────────────────────────────────
+        last_err = st.session_state.get("live_last_error", "")
+        if last_err:
+            st.markdown(f"""
+<div style="background:#FFEBEE;border:1px solid #EF9A9A;border-radius:10px;
+            padding:12px 18px;margin-bottom:12px;">
+  <strong style="color:#B71C1C;">❌ Connection failed</strong><br>
+  <span style="font-size:.88rem;color:#C62828;font-family:monospace;">{last_err}</span><br>
+  <span style="font-size:.82rem;color:#7F8C8D;margin-top:4px;display:block;">
+    Common causes: wrong IP · device off · cable not connected · firewall blocking port
+  </span>
+</div>""", unsafe_allow_html=True)
+
+        # ── Start button ──────────────────────────────────────────────────────
+        if st.button("▶ Start Live Stream", type="primary",
+                     use_container_width=True, key="btn_start_live"):
+            st.session_state.live_last_error = ""
+            with st.spinner("Connecting…" if mode == "tcp_live" else "Starting simulation…"):
+                try:
+                    if mode == "simulation":
+                        start_simulated_receiver(db)
+                        st.session_state.live_mode = True
+                    else:
+                        st.session_state["last_device_ip"] = device_ip
+                        start_live_receiver(db, host=device_ip, port=int(device_port))
+                        st.session_state.live_mode = True
+                except Exception as exc:
+                    err = str(exc)
+                    if "Connection refused" in err:
+                        msg = (f"Connection refused at {device_ip}:{device_port}. "
+                               "Device reachable but not accepting connections. "
+                               "Check port number or device network settings.")
+                    elif "timed out" in err or "No route" in err:
+                        msg = (f"Cannot reach {device_ip}. "
+                               "Check: Is the cable connected? "
+                               "Is the IP address correct? "
+                               "Are both devices on the same network?")
+                    elif "Name or service not known" in err:
+                        msg = "Hostname not found. Use an IP address (e.g. 192.168.1.100)."
+                    else:
+                        msg = err
+                    st.session_state.live_last_error = msg
+                    st.rerun()
+                    return
+            st.rerun()
         return
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Live data display
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Stream running — live display ─────────────────────────────────────────
+    status_col, stop_col = st.columns([5, 1])
+    with status_col:
+        is_sim = st.session_state.get("live_src_radio", "simulation") == "simulation"
+        label  = "🟢 Simulation active" if is_sim else "🔵 VitalFlow device connected"
+        st.markdown(
+            f'<div style="background:#E0F7FA;border:1px solid #00BCD4;border-radius:8px;'
+            f'padding:8px 16px;font-size:.9rem;font-weight:600;color:#006064;">'
+            f'{label} — {buf.row_count:,} records received</div>',
+            unsafe_allow_html=True,
+        )
+    with stop_col:
+        if st.button("⏹ Stop", use_container_width=True, key="btn_stop_live"):
+            from data_receiver import stop_live_receiver
+            stop_live_receiver()
+            st.session_state.live_mode = False
+            import data_receiver as _dr
+            _dr._tcp_receiver = None
+            _dr._live_buffer  = None
+            _dr._tcp_stop_event = None
+            st.rerun()
 
-    # Auto-refresh every 3 seconds using Streamlit's fragment mechanism
-    refresh_interval = st.slider(
-        "Refresh interval (seconds)", min_value=1, max_value=10, value=3,
-        key="live_refresh",
-    )
-    st.markdown(
-        f'<meta http-equiv="refresh" content="{refresh_interval}">',
-        unsafe_allow_html=True,
+    refresh_sec = st.select_slider(
+        "Auto-refresh", options=[1, 2, 3, 5, 10], value=3,
+        format_func=lambda x: f"Every {x}s", key="live_refresh_sel",
     )
 
     live_df = buf.get_dataframe(last_n=300)
     if live_df.empty:
-        st.info("Waiting for first data packet…")
+        st.info("⏳ Waiting for first data packet…")
+        _time.sleep(1)
+        st.rerun()
         return
 
-    # ── Live KPIs ─────────────────────────────────────────────────────────────
+    # KPIs
     last = live_df.iloc[-1]
-
-    st.markdown("### Current Measurements")
+    st.markdown("### Current Readings")
     k = st.columns(4)
 
-    def _live_metric(col_widget, label, col_name, unit, fmt=".2f"):
-        val = last.get(col_name)
-        if pd.notna(val):
-            col_widget.metric(label, f"{val:{fmt}} {unit}")
-        else:
-            col_widget.metric(label, "—")
+    def _kpi(w, label, col, unit, fmt=".2f", hi=None, lo=None):
+        val = last.get(col)
+        try:
+            val = float(val)
+        except (TypeError, ValueError):
+            w.metric(label, "—")
+            return
+        delta, dc = None, "off"
+        if hi is not None and val > hi:
+            delta, dc = f"⚠ above {hi}{unit}", "inverse"
+        elif lo is not None and val < lo:
+            delta, dc = f"⚠ below {lo}{unit}", "inverse"
+        w.metric(label, f"{val:{fmt}} {unit}", delta=delta, delta_color=dc)
 
-    _live_metric(k[0], "Blood Flow",    "flow_rate_lpm",       "L/min")
-    _live_metric(k[1], "ΔPressure",     "pressure_delta_mmhg", "mmHg", ".1f")
-    _live_metric(k[2], "Pre-oxy SatO₂", "sat_pre_pct",         "%",    ".1f")
-    _live_metric(k[3], "Pump Speed",    "pump_speed_rpm",      "RPM",  ".0f")
+    _kpi(k[0], "Blood Flow",    "flow_rate_lpm",       "L/min", ".2f", hi=6.0, lo=1.5)
+    _kpi(k[1], "ΔPressure",     "pressure_delta_mmhg", "mmHg",  ".1f", hi=60.0)
+    _kpi(k[2], "Pre-oxy SatO₂", "sat_pre_pct",         "%",     ".1f", lo=60.0)
+    _kpi(k[3], "Pump Speed",    "pump_speed_rpm",       "RPM",   ".0f", hi=4500.0)
 
-    st.markdown('<hr style="margin:0.75rem 0">', unsafe_allow_html=True)
+    st.markdown('<hr style="margin:.6rem 0">', unsafe_allow_html=True)
 
-    # ── Real-time clinical alerts ──────────────────────────────────────────────
+    # Clinical alerts
     st.markdown("### ⚕️ Active Clinical Alerts")
-    _note(
-        "Alerts are computed in real time from the last 300 data points "
-        "using the same evidence-based rules as the Early Warning tab."
-    )
+    _note("Rules computed on last 5 minutes of data. 🔴 CRITICAL  🟠 HIGH  🟡 MODERATE  🔵 LOW")
 
     try:
         _, summaries = run_all_rules(live_df)
         active = [s for s in summaries if s["events"] > 0]
+        SEV_SORT = {"CRITICAL":0,"HIGH":1,"MODERATE":2,"LOW":3}
+        SEV_ICON = {"CRITICAL":"🔴","HIGH":"🟠","MODERATE":"🟡","LOW":"🔵"}
 
         if not active:
-            st.success("✅ All parameters within normal limits — no active alerts.")
+            st.success("✅ All parameters within normal limits.")
         else:
-            SEV_ICON = {"CRITICAL": "🔴", "HIGH": "🟠", "MODERATE": "🟡", "LOW": "🔵"}
-            for s in sorted(active, key=lambda x: {"CRITICAL":0,"HIGH":1,"MODERATE":2,"LOW":3}[x["severity"]]):
+            for s in sorted(active, key=lambda x: SEV_SORT[x["severity"]]):
                 color = SEVERITY_COLORS.get(s["severity"], "#888")
+                bg    = {"CRITICAL":"#FFEBEE","HIGH":"#FFF3E0",
+                         "MODERATE":"#FFFDE7","LOW":"#E3F2FD"}.get(s["severity"],"#F5F5F5")
+                bdr   = {"CRITICAL":"#EF9A9A","HIGH":"#FFCC80",
+                         "MODERATE":"#FFF176","LOW":"#90CAF9"}.get(s["severity"],"#ddd")
                 st.markdown(
-                    f"**{SEV_ICON.get(s['severity'],'')} {s['label']}** — "
-                    f"<span style='color:{color};font-weight:700'>{s['severity']}</span>  "
-                    f"<span style='font-size:.85rem;color:var(--text-secondary)'>"
-                    f"{s['events']} events ({s['rate_pct']:.1f}%) — "
-                    f"{s['description']}</span>",
+                    f'<div style="background:{bg};border:1px solid {bdr};'
+                    f'border-radius:10px;padding:10px 16px;margin-bottom:8px;">'
+                    f'{SEV_ICON.get(s["severity"],"")}'
+                    f' <strong style="color:{color};">{s["label"]}</strong>'
+                    f' <span style="float:right;font-size:.78rem;color:{color};'
+                    f'font-weight:700;border:1px solid {color};border-radius:20px;'
+                    f'padding:1px 8px;">{s["severity"]}</span><br>'
+                    f'<span style="font-size:.85rem;color:#546E7A;">{s["description"]}</span><br>'
+                    f'<span style="font-size:.78rem;color:#90A4AE;">📖 {s["reference"]}</span>'
+                    f'</div>',
                     unsafe_allow_html=True,
                 )
     except Exception as exc:
         st.warning(f"Alert engine error: {exc}")
 
-    st.markdown('<hr style="margin:0.75rem 0">', unsafe_allow_html=True)
+    st.markdown('<hr style="margin:.6rem 0">', unsafe_allow_html=True)
 
-    # ── Live trend chart ──────────────────────────────────────────────────────
+    # Live trend chart
     st.markdown("### Live Trends — Last 5 minutes")
-    _note(
-        "Rolling view of the last 300 readings. "
-        "Red markers indicate active alarm conditions."
-    )
+    _note("Rolling window of the last 300 readings. Red markers = active alarm.")
 
-    available = [c for c in ["flow_rate_lpm","pressure_delta_mmhg","sat_pre_pct","pump_speed_rpm"]
-                 if c in live_df.columns and live_df[c].notna().any()]
+    avail = [c for c in ["flow_rate_lpm","pressure_delta_mmhg","sat_pre_pct","pump_speed_rpm"]
+             if c in live_df.columns and live_df[c].notna().any()]
 
-    if available and "timestamp" in live_df.columns:
-        n_show = min(4, len(available))
-        show   = available[:n_show]
-
-        fig = make_subplots(
-            rows=n_show, cols=1, shared_xaxes=True,
-            subplot_titles=[YAXIS_LABELS.get(c, DISPLAY_LABELS.get(c, c)) for c in show],
-            vertical_spacing=max(0.06, 0.12 / n_show),
-        )
+    if avail and "timestamp" in live_df.columns:
+        n = min(4, len(avail))
+        fig = make_subplots(rows=n, cols=1, shared_xaxes=True,
+                            subplot_titles=[YAXIS_LABELS.get(c, DISPLAY_LABELS.get(c,c))
+                                            for c in avail[:n]],
+                            vertical_spacing=max(0.06, 0.12/n))
         for ann in fig.layout.annotations:
             ann.font = dict(size=14, color=C["primary"])
             ann.x = 0; ann.xanchor = "left"
-
-        for i, col in enumerate(show, 1):
+        for i, col in enumerate(avail[:n], 1):
             _measurement_trace(fig, live_df["timestamp"], live_df[col],
-                               name=DISPLAY_LABELS.get(col, col), row=i, col=1)
+                               name=DISPLAY_LABELS.get(col,col), row=i, col=1)
             if "alarm_active" in live_df.columns:
-                alm = live_df[live_df["alarm_active"] == 1]
+                alm = live_df[live_df["alarm_active"]==1]
                 if not alm.empty:
                     _alarm_trace(fig, alm["timestamp"], alm[col],
-                                 show_legend=(i == 1), row=i, col=1)
-            fig.update_yaxes(
-                title_text=YAXIS_LABELS.get(col, ""),
-                title_font=dict(size=12),
-                showgrid=True, gridcolor=C["grid"],
-                row=i, col=1,
-            )
-
-        fig.update_layout(
-            **CHART_BASE_SUB,
-            height=max(260, 200 * n_show),
-            legend=dict(orientation="h", y=-0.1, x=0, font=dict(size=12)),
-        )
+                                 show_legend=(i==1), row=i, col=1)
+            fig.update_yaxes(title_text=YAXIS_LABELS.get(col,""),
+                             title_font=dict(size=12),
+                             showgrid=True, gridcolor=C["grid"], row=i, col=1)
+        fig.update_layout(**CHART_BASE_SUB, height=max(260, 200*n),
+                          legend=dict(orientation="h", y=-0.1, x=0, font=dict(size=12)))
         fig.update_xaxes(showgrid=True, gridcolor=C["grid"], tickfont=dict(size=12))
-        fig.update_xaxes(title_text="Time", title_font=dict(size=13), row=n_show, col=1)
+        fig.update_xaxes(title_text="Time", row=n, col=1)
         st.plotly_chart(fig, use_container_width=True)
 
-    # ── USB watcher status (compact) ──────────────────────────────────────────
-    usb = get_usb_watcher()
-    if usb and usb.is_alive():
-        with st.expander(f"🔌 USB watcher active — {usb.files_ingested} file(s) ingested", expanded=False):
-            st.caption(f"Watching: `{usb.watch_dir}`")
-            if usb.last_error:
-                st.warning(f"Last error: {usb.last_error}")
+    # Safe auto-rerun
+    _time.sleep(refresh_sec)
+    st.rerun()
 
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Tab: Overview  (v3 — restructured layout, better KPIs, cleaner sparklines)
 # ─────────────────────────────────────────────────────────────────────────────
 

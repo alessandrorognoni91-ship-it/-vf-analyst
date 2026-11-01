@@ -33,6 +33,9 @@ from data_cleaning import clean, compute_summary
 from data_model import VFDatabase
 from ml_model import VFModel
 from clinical_rules import run_all_rules, SEVERITY_COLORS, RuleResult
+from hl7_fhir import (
+    session_to_fhir_bundle_json, measurements_to_hl7, get_mdc_nomenclature_table,
+)
 from data_receiver import (
     start_live_receiver, start_simulated_receiver, start_usb_watcher,
     get_live_buffer, get_usb_watcher, LiveBuffer,
@@ -2339,7 +2342,7 @@ def _tab_audit(db: VFDatabase, session_id: int) -> None:
         prov = json.loads(row["provenance"])
     except Exception:
         st.warning("Audit data unavailable.")
-        return
+        prov = {}
 
     step_labels = {
         "timestamp":    "🕐 Timestamp Standardisation",
@@ -2386,6 +2389,68 @@ def _tab_audit(db: VFDatabase, session_id: int) -> None:
 
     with st.expander("🗂️ Raw Session Record (for technical review)", expanded=False):
         st.json(dict(row))
+
+    _render_interop_export(db, session_id, row)
+
+
+def _render_interop_export(db: VFDatabase, session_id: int, row: pd.Series) -> None:
+    """HL7 v2 / FHIR R4 / IEEE 11073 export of the active session (read-only)."""
+    st.markdown("### Interoperability Export (HL7 · FHIR · IEEE 11073)")
+    _note(
+        "Exports the active session in standard formats for exchange with hospital "
+        "information systems. Output is for research/demonstration: parameter codes "
+        "marked PROVISIONAL must be verified against IEEE 11073-10101 and LOINC "
+        "before any real HIS/EHR integration."
+    )
+
+    meas = db.get_measurements(session_id)
+    if meas.empty:
+        st.info("No measurements available for this session.")
+        return
+
+    c1, c2 = st.columns(2)
+    with c1:
+        patient_id = st.text_input(
+            "Patient identifier (pseudonymised)", value="PSEUDO-001",
+            key="interop_patient_id",
+            help="Use a pseudonymised ID. Do not enter real patient names.",
+        )
+    with c2:
+        max_rows = st.number_input(
+            "Time points to export", min_value=1, max_value=2000, value=200,
+            step=50, key="interop_max_rows",
+            help="FHIR bundles above ~1 MB may be rejected by servers.",
+        )
+
+    case = str(row.get("case_id", session_id))
+    hl7_text = measurements_to_hl7(meas, patient_id=patient_id,
+                                   session_id=str(session_id),
+                                   max_rows=int(min(max_rows, 500)))
+    d1, d2 = st.columns(2)
+    with d1:
+        st.download_button(
+            "⬇ FHIR R4 Bundle (.json)",
+            data=session_to_fhir_bundle_json(row, meas, patient_id=patient_id,
+                                             max_rows=int(max_rows)),
+            file_name=f"case_{case}_fhir_bundle.json",
+            mime="application/fhir+json",
+            use_container_width=True, key="dl_fhir",
+        )
+    with d2:
+        st.download_button(
+            "⬇ HL7 v2.9 ORU^R01 (.hl7)",
+            data=hl7_text.replace('\\n\\n---\\n\\n', ""),
+            file_name=f"case_{case}_oru.hl7",
+            mime="text/plain",
+            use_container_width=True, key="dl_hl7",
+        )
+
+    with st.expander("📖 Parameter nomenclature (IEEE 11073 / LOINC)", expanded=False):
+        st.dataframe(get_mdc_nomenclature_table(), use_container_width=True, hide_index=True)
+
+    with st.expander("👁 Preview first HL7 message", expanded=False):
+        first = hl7_text.split('\\n\\n---\\n\\n')[0]
+        st.code(first.replace("\r", "\n"), language="text")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -54,6 +54,7 @@ import pandas as pd
 from data_loader import load_csv
 from data_cleaning import clean
 from data_model import VFDatabase
+from hl7_fhir import parse_hl7_oru, build_ack, MLLP_START, MLLP_END
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +153,11 @@ def _parse_packet(data: bytes) -> Optional[dict]:
     if not raw:
         return None
 
-    # ── Try JSON first ────────────────────────────────────────────────────────
+    # ── HL7 v2 ORU^R01 (standard device-to-CIS format) ───────────────────────
+    if raw.lstrip(b"\x0b").startswith(b"MSH|"):
+        return parse_hl7_oru(raw)
+
+    # ── Try JSON ────────────────────────────────────────────────────────
     try:
         obj = json.loads(raw)
         return {
@@ -249,7 +254,23 @@ class TCPReceiver(threading.Thread):
                             raise ConnectionResetError("Device closed connection")
 
                         remainder += chunk
-                        while self.LINE_DELIMITER in remainder:
+
+                        # HL7 over MLLP: frames are <VT> message <FS><CR>
+                        while MLLP_START in remainder and MLLP_END in remainder:
+                            start = remainder.index(MLLP_START)
+                            end   = remainder.index(MLLP_END, start)
+                            frame = remainder[start:end + len(MLLP_END)]
+                            remainder = remainder[end + len(MLLP_END):]
+                            row = _parse_packet(frame)
+                            try:
+                                sock.sendall(build_ack(ack_code="AA" if row else "AE"))
+                            except OSError:
+                                pass
+                            if row:
+                                self.buffer.push(row)
+                                self.packets_received += 1
+
+                        while self.LINE_DELIMITER in remainder and MLLP_START not in remainder:
                             line, remainder = remainder.split(self.LINE_DELIMITER, 1)
                             row = _parse_packet(line)
                             if row:

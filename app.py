@@ -25,6 +25,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import os
 import streamlit as st
 
 from config import MEASUREMENT_COLS, DISPLAY_LABELS
@@ -369,7 +370,23 @@ def _alarm_trace(fig, x, y, name: str = "Alarm active", show_legend: bool = True
 
 @st.cache_resource
 def _get_db() -> VFDatabase:
-    return VFDatabase(":memory:")
+    # On the Raspberry Pi VF_DB_PATH points to a file so data survives reboots.
+    return VFDatabase(os.environ.get("VF_DB_PATH", ":memory:"))
+
+
+@st.cache_resource
+def _start_usb_once(watch_dir: str):
+    return start_usb_watcher(_get_db(), watch_dir=watch_dir)
+
+
+def _ensure_usb_watcher() -> None:
+    """Start the USB auto-import watcher once per process if VF_USB_WATCH_DIR is set."""
+    watch_dir = os.environ.get("VF_USB_WATCH_DIR", "").strip()
+    if watch_dir:
+        try:
+            _start_usb_once(watch_dir)
+        except Exception as exc:
+            st.session_state["usb_watch_error"] = str(exc)
 
 
 def _init_state() -> None:
@@ -2461,6 +2478,7 @@ def main() -> None:
     _inject_css()
     _init_state()
     db = st.session_state.db
+    _ensure_usb_watcher()
 
     app_mode = st.session_state.get("app_mode")  # "csv" | "live" | None
 
@@ -2489,6 +2507,13 @@ def main() -> None:
 
     # CSV mode: full sidebar + dashboard
     active_id, selected_ids, filters = _render_sidebar(db)
+
+    usb = get_usb_watcher()
+    if usb is not None and usb.is_alive():
+        with st.sidebar:
+            st.caption(f"🔌 USB auto-import attivo · {usb.files_ingested} file importati")
+            if st.button("↻ Controlla chiavetta", use_container_width=True, key="btn_usb_refresh"):
+                st.rerun()
 
     if active_id is None:
         # CSV mode but no file loaded yet — show upload prompt

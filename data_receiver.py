@@ -78,6 +78,7 @@ class LiveBuffer:
         self.session_id = session_id
         self._lock      = threading.Lock()
         self._rows:  list[dict] = []
+        self._pending: list[dict] = []   # rows not yet written to SQLite
         self._last_flush = time.time()
 
     def push(self, row: dict) -> None:
@@ -85,6 +86,7 @@ class LiveBuffer:
         row.setdefault("timestamp", datetime.utcnow().isoformat())
         with self._lock:
             self._rows.append(row)
+            self._pending.append(row)
             if len(self._rows) > self.MAX_ROWS:
                 self._rows = self._rows[-self.MAX_ROWS:]
 
@@ -104,11 +106,13 @@ class LiveBuffer:
         return df
 
     def flush_to_db(self) -> None:
-        """Persist buffered rows to SQLite. Called automatically."""
+        """Persist only the rows not yet written (no duplicates). Called automatically."""
         with self._lock:
-            if not self._rows:
+            if not self._pending:
+                self._last_flush = time.time()
                 return
-            rows_to_flush = self._rows.copy()
+            rows_to_flush = self._pending
+            self._pending = []
 
         try:
             df = pd.DataFrame(rows_to_flush)
@@ -120,6 +124,8 @@ class LiveBuffer:
                          len(rows_to_flush), self.session_id)
         except Exception as exc:
             logger.warning("DB flush failed: %s", exc)
+            with self._lock:                    # keep rows for the next attempt
+                self._pending = rows_to_flush + self._pending
 
     @property
     def row_count(self) -> int:
@@ -225,14 +231,14 @@ class TCPReceiver(threading.Thread):
         self.buffer     = buffer
         self.host       = host
         self.port       = port
-        self._stop      = stop_event
+        self._stop_evt      = stop_event
         self.connected  = False
         self.error_msg: str = ""
         self.packets_received = 0
 
     def run(self) -> None:
         delay = self.RECONNECT_DELAY_SEC
-        while not self._stop.is_set():
+        while not self._stop_evt.is_set():
             try:
                 logger.info("Connecting to %s:%d…", self.host, self.port)
                 with socket.create_connection(
@@ -245,7 +251,7 @@ class TCPReceiver(threading.Thread):
                     logger.info("Connected to VitalFlow at %s:%d", self.host, self.port)
 
                     remainder = b""
-                    while not self._stop.is_set():
+                    while not self._stop_evt.is_set():
                         try:
                             chunk = sock.recv(4096)
                         except socket.timeout:
@@ -281,7 +287,7 @@ class TCPReceiver(threading.Thread):
                 self.connected = False
                 self.error_msg = str(exc)
                 logger.warning("TCP error: %s — retry in %ds", exc, delay)
-                self._stop.wait(delay)
+                self._stop_evt.wait(delay)
                 delay = min(delay * 2, self.MAX_RECONNECT_DELAY)
 
         self.buffer.flush_to_db()
@@ -370,7 +376,7 @@ class SimulatedReceiver(threading.Thread):
                  hz: float = 1.0):
         super().__init__(daemon=True, name="SimulatedReceiver")
         self.buffer     = buffer
-        self._stop      = stop_event
+        self._stop_evt      = stop_event
         self._interval  = 1.0 / hz
         self.connected  = True   # always "connected" in sim mode
         self.error_msg  = ""
@@ -414,11 +420,11 @@ class SimulatedReceiver(threading.Thread):
 
     def run(self) -> None:
         logger.info("Simulated receiver started (1 Hz)")
-        while not self._stop.is_set():
+        while not self._stop_evt.is_set():
             row = self._next_row()
             self.buffer.push(row)
             self.packets_received += 1
-            self._stop.wait(self._interval)
+            self._stop_evt.wait(self._interval)
         self.buffer.flush_to_db()
         logger.info("Simulated receiver stopped")
 
@@ -478,7 +484,7 @@ class USBWatcher(threading.Thread):
         super().__init__(daemon=True, name="USBWatcher")
         self.db            = db
         self.watch_dir     = Path(watch_dir)
-        self._stop         = stop_event
+        self._stop_evt         = stop_event
         self._interval     = poll_interval
         self.on_new_file   = on_new_file
         self._seen:  set   = set()
@@ -488,36 +494,48 @@ class USBWatcher(threading.Thread):
     def run(self) -> None:
         logger.info("USB watcher started → %s", self.watch_dir)
 
-        # Pre-populate seen set (don't re-ingest existing files on startup)
-        if self.watch_dir.exists():
-            self._seen = {
-                f.name for f in self.watch_dir.glob("*.csv")
-            }
-
-        while not self._stop.is_set():
-            self._stop.wait(self._interval)
+        while not self._stop_evt.is_set():
+            self._stop_evt.wait(self._interval)
             self._scan()
 
         logger.info("USB watcher stopped")
+
+    def _csv_files(self) -> list[Path]:
+        """CSVs directly in watch_dir and one level down (auto-mounted USB sticks)."""
+        files = list(self.watch_dir.glob("*.csv")) + list(self.watch_dir.glob("*/*.csv"))
+        return sorted(files)
 
     def _scan(self) -> None:
         if not self.watch_dir.exists():
             return
 
-        for csv_path in sorted(self.watch_dir.glob("*.csv")):
-            if csv_path.name in self._seen:
+        known = set()
+        try:
+            sdf = self.db.get_sessions()
+            if not sdf.empty:
+                known = set(sdf["filename"].astype(str))
+        except Exception:
+            pass
+
+        for csv_path in self._csv_files():
+            key = str(csv_path)
+            if key in self._seen:
+                continue
+            if csv_path.name in known:          # already imported (e.g. same stick re-inserted)
+                self._seen.add(key)
                 continue
 
-            logger.info("New CSV detected: %s", csv_path.name)
+            logger.info("New CSV detected: %s", csv_path)
             try:
                 sid = self._ingest(csv_path)
-                self._seen.add(csv_path.name)
+                self._seen.add(key)
                 self.files_ingested += 1
                 self.last_error = ""
                 if self.on_new_file:
                     self.on_new_file(sid, csv_path.name)
-                logger.info("Auto-ingested %s → session %d", csv_path.name, sid)
+                logger.info("Auto-ingested %s -> session %d", csv_path.name, sid)
             except Exception as exc:
+                self._seen.add(key)             # don't retry a broken file every 5 s
                 self.last_error = f"{csv_path.name}: {exc}"
                 logger.warning("Auto-ingest failed for %s: %s", csv_path.name, exc)
 
@@ -575,7 +593,12 @@ def start_usb_watcher(
         logger.info("USB watcher already running")
         return _usb_watcher
 
-    Path(watch_dir).mkdir(parents=True, exist_ok=True)
+    try:
+        Path(watch_dir).mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        # e.g. /media/<user> is created by the OS when the first stick is mounted;
+        # the watcher simply waits until it appears.
+        pass
     _usb_stop_event = threading.Event()
     _usb_watcher    = USBWatcher(db, watch_dir, _usb_stop_event,
                                   on_new_file=on_new_file)

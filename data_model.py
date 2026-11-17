@@ -19,9 +19,11 @@ alarm_events    : subset of measurements where alarm_active = True
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -96,6 +98,15 @@ MEAS_COLS = [
 # Database class
 # ---------------------------------------------------------------------------
 
+def _locked(fn):
+    """Serialise access to the shared SQLite connection (UI + receiver threads)."""
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return fn(self, *args, **kwargs)
+    return wrapper
+
+
 class VFDatabase:
     """
     Thin wrapper around an SQLite connection.
@@ -104,6 +115,9 @@ class VFDatabase:
 
     def __init__(self, db_path: str = DEFAULT_DB):
         self.db_path = db_path
+        self._lock = threading.RLock()
+        if db_path != ":memory:":
+            Path(db_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._init_schema()
@@ -116,7 +130,7 @@ class VFDatabase:
     # ------------------------------------------------------------------
     # Write operations
     # ------------------------------------------------------------------
-
+    @_locked
     def insert_session(
         self,
         case_id: str,
@@ -143,7 +157,7 @@ class VFDatabase:
         )
         self.conn.commit()
         return cur.lastrowid  # type: ignore[return-value]
-
+    @_locked
     def insert_measurements(self, df: pd.DataFrame, session_id: int) -> int:
         """Bulk-insert measurement rows. Returns number of rows inserted."""
         cols_present = [c for c in MEAS_COLS if c in df.columns]
@@ -159,7 +173,7 @@ class VFDatabase:
         subset.to_sql("measurements", self.conn, if_exists="append", index=False)
         self.conn.commit()
         return len(subset)
-
+    @_locked
     def insert_alarm_events(self, df: pd.DataFrame, session_id: int) -> int:
         """Extract and store rows where any alarm was active."""
         alarm_rows = []
@@ -197,10 +211,10 @@ class VFDatabase:
     # ------------------------------------------------------------------
     # Read operations
     # ------------------------------------------------------------------
-
+    @_locked
     def get_sessions(self) -> pd.DataFrame:
         return pd.read_sql("SELECT * FROM sessions ORDER BY uploaded_at DESC", self.conn)
-
+    @_locked
     def get_measurements(self, session_id: Optional[int] = None) -> pd.DataFrame:
         if session_id is not None:
             df = pd.read_sql(
@@ -217,7 +231,7 @@ class VFDatabase:
             df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
 
         return df
-
+    @_locked
     def get_measurements_multi(self, session_ids: list[int]) -> pd.DataFrame:
         """
         Return measurements for multiple sessions, tagged with session_id.
@@ -234,7 +248,7 @@ class VFDatabase:
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
         return df
-
+    @_locked
     def get_alarm_events(self, session_id: Optional[int] = None) -> pd.DataFrame:
         if session_id is not None:
             return pd.read_sql(
@@ -245,7 +259,7 @@ class VFDatabase:
         return pd.read_sql(
             "SELECT * FROM alarm_events ORDER BY timestamp", self.conn
         )
-
+    @_locked
     def get_alarm_events_multi(self, session_ids: list[int]) -> pd.DataFrame:
         """Return alarm events for multiple sessions."""
         if not session_ids:
@@ -256,6 +270,6 @@ class VFDatabase:
             self.conn,
             params=session_ids,
         )
-
+    @_locked
     def close(self) -> None:
         self.conn.close()

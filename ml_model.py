@@ -29,6 +29,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     roc_auc_score,
+    average_precision_score,
     classification_report,
     confusion_matrix,
 )
@@ -39,6 +40,7 @@ from sklearn.impute import SimpleImputer
 
 from config import MEASUREMENT_COLS, DISPLAY_LABELS
 from data_cleaning import engineer_features, make_alarm_target
+from plot_prep import normalize_rate
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +131,8 @@ class VFModel:
 
         frames = []
         for df in sessions_data[:self.MAX_SESSIONS_FOR_TRAINING]:
-            df_feat = engineer_features(df, window=10)
+            # Same sampling basis for every source: 1 sample/min (device log rate)
+            df_feat = engineer_features(normalize_rate(df), window=10)
             df_feat = make_alarm_target(df_feat, horizon=self.horizon)
             frames.append(df_feat)
 
@@ -143,7 +146,11 @@ class VFModel:
         target_col = "alarm_future"
 
         # Drop rows where target is NaN
-        valid = combined[feat_cols + [target_col]].dropna(subset=[target_col])
+        # Keep only rows with NO alarm active now: predict a NEW alarm, not persistence.
+        keep = combined[target_col].notna()
+        if "alarm_active" in combined.columns:
+            keep &= combined["alarm_active"].fillna(0).astype(int) == 0
+        valid = combined.loc[keep, feat_cols + [target_col]]
         X = valid[feat_cols].values
         y = valid[target_col].astype(int).values
 
@@ -155,8 +162,14 @@ class VFModel:
 
         # Time-aware split: first 80% train, last 20% test
         split_idx = int(len(X) * 0.8)
-        X_train, X_test = X[:split_idx], X[split_idx:]
-        y_train, y_test = y[:split_idx], y[split_idx:]
+        embargo = self.horizon + 10          # rows shared by overlapping windows
+        X_train, X_test = X[:split_idx], X[split_idx + embargo:]
+        y_train, y_test = y[:split_idx], y[split_idx + embargo:]
+        if len(np.unique(y_train)) < 2 or len(np.unique(y_test)) < 2 or len(y_test) < 20:
+            raise ValueError(
+                "Not enough alarm onsets in both the training and the test part. "
+                "Select more or longer sessions."
+            )
 
         # Build pipeline
         clf = self._build_classifier()
@@ -174,6 +187,8 @@ class VFModel:
 
         self.metrics = {
             "auc":             round(float(roc_auc_score(y_test, y_proba)), 3),
+            "avg_precision":   round(float(average_precision_score(y_test, y_proba)), 3),
+            "base_rate_test":  round(float(y_test.mean()), 3),
             "train_samples":   int(len(X_train)),
             "test_samples":    int(len(X_test)),
             "alarm_rate_train": round(float(y_train.mean()), 3),
@@ -241,13 +256,14 @@ class VFModel:
         if not self.trained or self._pipeline is None:
             raise RuntimeError("Model must be trained before predicting.")
 
-        df_feat = engineer_features(df, window=10)
+        df_feat = engineer_features(normalize_rate(df), window=10)
         feat_cols_present = [c for c in self._feature_cols if c in df_feat.columns]
 
         if not feat_cols_present:
             raise ValueError("No features found in the provided session data.")
 
-        X = df_feat[feat_cols_present].values
+        # Same columns/order as in training; missing ones become NaN -> imputed
+        X = df_feat.reindex(columns=self._feature_cols).values
 
         # Impute missing feature cols that were in training but not here
         # (pipeline imputer handles NaN gracefully)

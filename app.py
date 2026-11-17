@@ -33,7 +33,8 @@ from data_loader import load_csv
 from data_cleaning import clean, compute_summary
 from data_model import VFDatabase
 from ml_model import VFModel
-from clinical_rules import run_all_rules, SEVERITY_COLORS, RuleResult
+from clinical_rules import run_all_rules, SEVERITY_COLORS, RuleResult, THRESHOLDS as TH
+import plot_prep as pp
 from hl7_fhir import (
     session_to_fhir_bundle_json, measurements_to_hl7, get_mdc_nomenclature_table,
 )
@@ -1038,112 +1039,233 @@ def _tab_live_monitor(db: VFDatabase) -> None:
         format_func=lambda x: f"Every {x}s", key="live_refresh_sel",
     )
 
-    live_df = buf.get_dataframe(last_n=300)
+    live_df = buf.get_dataframe(last_n=3600)
     if live_df.empty:
         st.info("⏳ Waiting for first data packet…")
         _time.sleep(1)
         st.rerun()
         return
 
-    # KPIs
-    last = live_df.iloc[-1]
-    st.markdown("### Current Readings")
-    k = st.columns(4)
-
-    def _kpi(w, label, col, unit, fmt=".2f", hi=None, lo=None):
-        val = last.get(col)
-        try:
-            val = float(val)
-        except (TypeError, ValueError):
-            w.metric(label, "—")
-            return
-        delta, dc = None, "off"
-        if hi is not None and val > hi:
-            delta, dc = f"⚠ above {hi}{unit}", "inverse"
-        elif lo is not None and val < lo:
-            delta, dc = f"⚠ below {lo}{unit}", "inverse"
-        w.metric(label, f"{val:{fmt}} {unit}", delta=delta, delta_color=dc)
-
-    _kpi(k[0], "Blood Flow",    "flow_rate_lpm",       "L/min", ".2f", hi=6.0, lo=1.5)
-    _kpi(k[1], "ΔPressure",     "pressure_delta_mmhg", "mmHg",  ".1f", hi=60.0)
-    _kpi(k[2], "Pre-oxy SatO₂", "sat_pre_pct",         "%",     ".1f", lo=60.0)
-    _kpi(k[3], "Pump Speed",    "pump_speed_rpm",       "RPM",   ".0f", hi=4500.0)
-
+    _kpi_row(live_df, "Current Readings")
     st.markdown('<hr style="margin:.6rem 0">', unsafe_allow_html=True)
 
-    # Clinical alerts
-    st.markdown("### ⚕️ Active Clinical Alerts")
-    _note("Rules computed on last 5 minutes of data. 🔴 CRITICAL  🟠 HIGH  🟡 MODERATE  🔵 LOW")
-
+    st.markdown("### ⚕️ Clinical Alerts")
+    _note("Same rules as the file analysis, evaluated on everything buffered (up to 1 h) "
+          "at 1 sample per minute. 🔴 CRITICAL  🟠 HIGH  🟡 MODERATE  🔵 LOW")
     try:
-        _, summaries = run_all_rules(live_df)
-        active = [s for s in summaries if s["events"] > 0]
-        SEV_SORT = {"CRITICAL":0,"HIGH":1,"MODERATE":2,"LOW":3}
-        SEV_ICON = {"CRITICAL":"🔴","HIGH":"🟠","MODERATE":"🟡","LOW":"🔵"}
-
-        if not active:
-            st.success("✅ All parameters within normal limits.")
-        else:
-            for s in sorted(active, key=lambda x: SEV_SORT[x["severity"]]):
-                color = SEVERITY_COLORS.get(s["severity"], "#888")
-                bg    = {"CRITICAL":"#FFEBEE","HIGH":"#FFF3E0",
-                         "MODERATE":"#FFFDE7","LOW":"#E3F2FD"}.get(s["severity"],"#F5F5F5")
-                bdr   = {"CRITICAL":"#EF9A9A","HIGH":"#FFCC80",
-                         "MODERATE":"#FFF176","LOW":"#90CAF9"}.get(s["severity"],"#ddd")
-                st.markdown(
-                    f'<div style="background:{bg};border:1px solid {bdr};'
-                    f'border-radius:10px;padding:10px 16px;margin-bottom:8px;">'
-                    f'{SEV_ICON.get(s["severity"],"")}'
-                    f' <strong style="color:{color};">{s["label"]}</strong>'
-                    f' <span style="float:right;font-size:.78rem;color:{color};'
-                    f'font-weight:700;border:1px solid {color};border-radius:20px;'
-                    f'padding:1px 8px;">{s["severity"]}</span><br>'
-                    f'<span style="font-size:.85rem;color:#546E7A;">{s["description"]}</span><br>'
-                    f'<span style="font-size:.78rem;color:#90A4AE;">📖 {s["reference"]}</span>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
+        enriched, summaries = _run_rules(live_df)
+        _alert_cards(enriched, summaries, "buffer")
     except Exception as exc:
         st.warning(f"Alert engine error: {exc}")
 
     st.markdown('<hr style="margin:.6rem 0">', unsafe_allow_html=True)
-
-    # Live trend chart
-    st.markdown("### Live Trends — Last 5 minutes")
-    _note("Rolling window of the last 300 readings. Red markers = active alarm.")
-
-    avail = [c for c in ["flow_rate_lpm","pressure_delta_mmhg","sat_pre_pct","pump_speed_rpm"]
-             if c in live_df.columns and live_df[c].notna().any()]
-
-    if avail and "timestamp" in live_df.columns:
-        n = min(4, len(avail))
-        fig = make_subplots(rows=n, cols=1, shared_xaxes=True,
-                            subplot_titles=[YAXIS_LABELS.get(c, DISPLAY_LABELS.get(c,c))
-                                            for c in avail[:n]],
-                            vertical_spacing=max(0.06, 0.12/n))
-        for ann in fig.layout.annotations:
-            ann.font = dict(size=14, color=C["primary"])
-            ann.x = 0; ann.xanchor = "left"
-        for i, col in enumerate(avail[:n], 1):
-            _measurement_trace(fig, live_df["timestamp"], live_df[col],
-                               name=DISPLAY_LABELS.get(col,col), row=i, col=1)
-            if "alarm_active" in live_df.columns:
-                alm = live_df[live_df["alarm_active"]==1]
-                if not alm.empty:
-                    _alarm_trace(fig, alm["timestamp"], alm[col],
-                                 show_legend=(i==1), row=i, col=1)
-            fig.update_yaxes(title_text=YAXIS_LABELS.get(col,""),
-                             title_font=dict(size=12),
-                             showgrid=True, gridcolor=C["grid"], row=i, col=1)
-        fig.update_layout(**CHART_BASE_SUB, height=max(260, 200*n),
-                          legend=dict(orientation="h", y=-0.1, x=0, font=dict(size=12)))
-        fig.update_xaxes(showgrid=True, gridcolor=C["grid"], tickfont=dict(size=12))
-        fig.update_xaxes(title_text="Time", row=n, col=1)
-        st.plotly_chart(fig, use_container_width=True)
+    st.markdown("### Live Trends")
+    _note("Same chart as the file analysis. The red strip shows when a device alarm was active.")
+    _trend_section(live_df, DEFAULT_TREND_PARAMS, key="lv", live=True, row_h=170)
 
     # Safe auto-rerun
     _time.sleep(refresh_sec)
     st.rerun()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SHARED RENDERING  — used by BOTH the CSV dashboard and the Live monitor
+# so the same data always produces the same picture and the same alerts.
+# ─────────────────────────────────────────────────────────────────────────────
+
+SEV_SORT = {"CRITICAL": 0, "HIGH": 1, "MODERATE": 2, "LOW": 3}
+SEV_ICON = {"CRITICAL": "🔴", "HIGH": "🟠", "MODERATE": "🟡", "LOW": "🔵"}
+SEV_BG   = {"CRITICAL": "#FFEBEE", "HIGH": "#FFF3E0", "MODERATE": "#FFFDE7", "LOW": "#E3F2FD"}
+SEV_BDR  = {"CRITICAL": "#EF9A9A", "HIGH": "#FFCC80", "MODERATE": "#FFF176", "LOW": "#90CAF9"}
+
+
+def _gap_axes(fig, recs: list, rows: int) -> None:
+    """Collapse the empty time between recordings and mark where each one starts."""
+    if len(recs) < 2:
+        return
+    fmt = "%Y-%m-%d %H:%M:%S.%f"
+    breaks = [
+        dict(bounds=[s.strftime(fmt), e.strftime(fmt)], pattern="")
+        for s, e in pp.gap_bounds(recs)
+    ]
+    fig.update_xaxes(rangebreaks=breaks)
+    for rec in recs[1:]:
+        for r in range(1, rows + 1):
+            fig.add_vline(x=rec["start"].strftime(fmt), line_width=1,
+                          line_dash="dot", line_color=C["subtle"], row=r, col=1)
+
+
+def _trend_figure(df: pd.DataFrame, cols: list, row_h: int = 210) -> go.Figure:
+    """
+    One figure for every source: a line per parameter (no dots) and, underneath,
+    a single strip showing when a device alarm was active.
+    """
+    d = pp.prepare_timeseries(df)
+    recs = pp.find_recordings(d)
+    d = pp.insert_gap_breaks(d)
+    has_alarm = "alarm_active" in d.columns and (d["alarm_active"].fillna(0) > 0).any()
+    n = len(cols)
+    rows = n + (1 if has_alarm else 0)
+    titles = [YAXIS_LABELS.get(c, DISPLAY_LABELS.get(c, c)) for c in cols]
+    heights = [1.0] * n
+    if has_alarm:
+        titles.append("Device alarm")
+        heights.append(0.25)
+    fig = make_subplots(
+        rows=rows, cols=1, shared_xaxes=True, row_heights=heights,
+        subplot_titles=titles, vertical_spacing=max(0.04, min(0.10, 0.45 / rows)),
+    )
+    for ann in fig.layout.annotations:
+        ann.font = dict(size=14, color=C["primary"])
+        ann.x = 0
+        ann.xanchor = "left"
+
+    for i, col in enumerate(cols, start=1):
+        y = d[col]
+        _measurement_trace(fig, d["timestamp"], y, name=DISPLAY_LABELS.get(col, col),
+                           row=i, col=1)
+        # A recording with a single sample would draw nothing: show only those.
+        lone = y.notna() & y.shift(1).isna() & y.shift(-1).isna()
+        if lone.any():
+            fig.add_trace(go.Scatter(
+                x=d.loc[lone, "timestamp"], y=y[lone], mode="markers",
+                marker=dict(size=5, color=C["accent"]), showlegend=False,
+                hoverinfo="skip"), row=i, col=1)
+        fig.update_yaxes(showgrid=True, gridcolor=C["grid"], tickfont=dict(size=12),
+                         row=i, col=1)
+
+    if has_alarm:
+        fig.add_trace(go.Scatter(
+            x=d["timestamp"], y=d["alarm_active"].fillna(0).clip(0, 1),
+            mode="lines", line=dict(width=0, shape="hv"), fill="tozeroy",
+            fillcolor=C["alarm"], name="Device alarm active", showlegend=False,
+        ), row=rows, col=1)
+        fig.update_yaxes(range=[0, 1], showticklabels=False, showgrid=False,
+                         row=rows, col=1)
+
+    fig.update_xaxes(showgrid=True, gridcolor=C["grid"], tickfont=dict(size=12))
+    fig.update_xaxes(title_text="Time", row=rows, col=1)
+    _gap_axes(fig, recs, rows)
+    fig.update_layout(**CHART_BASE_SUB, height=max(260, row_h * n + (70 if has_alarm else 0) + 70),
+                      showlegend=False, hovermode="x unified")
+    return fig
+
+
+def _trend_controls(df: pd.DataFrame, key: str, live: bool = False) -> pd.DataFrame:
+    """Recording + time-window selectors (identical options for CSV and Live)."""
+    d = pp.prepare_timeseries(df)
+    if d.empty:
+        return d
+    recs = pp.find_recordings(d)
+    c1, c2 = st.columns(2)
+    one_rec = len(recs) == 1
+    if len(recs) > 1:
+        labels = ["All recordings"] + [pp.recording_label(i, r) for i, r in enumerate(recs)]
+        with c1:
+            pick = st.selectbox("Recording", labels, key=key + "_rec",
+                                help="A log with pauses is split into continuous recordings. "
+                                     "The empty time between them is not drawn.")
+        if pick != "All recordings":
+            r = recs[labels.index(pick) - 1]
+            d = d[(d["timestamp"] >= r["start"]) & (d["timestamp"] <= r["end"])]
+            one_rec = True
+    if one_rec:
+        span = (d["timestamp"].max() - d["timestamp"].min()).total_seconds()
+        opts = pp.window_options(span, live)
+        with c2:
+            names = [o[0] for o in opts]
+            default = 0 if live else len(names) - 1
+            label = st.selectbox("Time window", names, index=default, key=key + "_win")
+        d = pp.apply_window(d, dict(opts)[label])
+    return d
+
+
+def _trend_section(df: pd.DataFrame, cols: list, key: str, live: bool = False,
+                   row_h: int = 210) -> None:
+    view = _trend_controls(df, key, live)
+    cols = [c for c in cols if c in view.columns and view[c].notna().any()]
+    if view.empty or not cols:
+        st.info("No data to plot in this selection.")
+        return
+    st.plotly_chart(_trend_figure(view, cols, row_h), use_container_width=True)
+
+
+def _run_rules(df: pd.DataFrame, save_kwargs: Optional[dict] = None):
+    """Rules always see 1 sample/min, whatever the source (see plot_prep.normalize_rate)."""
+    return run_all_rules(pp.normalize_rate(df), save_kwargs=save_kwargs)
+
+
+def _kpi_row(df: pd.DataFrame, heading: str) -> None:
+    """Latest values with the SAME limits (clinical_rules.THRESHOLDS) for CSV and Live."""
+    d = pp.prepare_timeseries(df)
+    if d.empty:
+        return
+    last = d.iloc[-1]
+    st.markdown(f"### {heading}")
+    st.caption(f"Latest sample: {last['timestamp']:%d %b %Y %H:%M:%S}")
+    k = st.columns(4)
+
+    def _one(w, label, col, unit, fmt, hi=None, lo=None):
+        try:
+            val = float(last.get(col))
+        except (TypeError, ValueError):
+            val = float("nan")
+        if val != val:
+            w.metric(label, "—")
+            return
+        delta, dc = None, "off"
+        if hi is not None and val > hi:
+            delta, dc = f"above {hi:g} {unit}", "inverse"
+        elif lo is not None and val < lo:
+            delta, dc = f"below {lo:g} {unit}", "inverse"
+        w.metric(label, f"{val:{fmt}} {unit}", delta=delta, delta_color=dc)
+
+    _one(k[0], "Blood Flow", "flow_rate_lpm", "L/min", ".2f", lo=TH["flow_low_lpm"])
+    _one(k[1], "ΔPressure", "pressure_delta_mmhg", "mmHg", ".1f", hi=TH["delta_high_mmhg"])
+    _one(k[2], "Post-oxy SatO₂", "sat_post_pct", "%", ".1f", lo=TH["sat_post_low_pct"])
+    _one(k[3], "Pump Speed", "pump_speed_rpm", "RPM", ".0f")
+
+
+def _alert_cards(enriched: pd.DataFrame, summaries: list, scope: str) -> None:
+    """Rule cards: ACTIVE NOW / last seen, severity, events. Same for CSV and Live."""
+    fired = sorted([s for s in summaries if s["events"] > 0],
+                   key=lambda s: SEV_SORT.get(s["severity"], 9))
+    clear = [s for s in summaries if s["events"] == 0]
+    if not fired:
+        st.success("✅ No clinical rule fired in this " + scope + ".")
+    for s in fired:
+        col = "alert_" + s["rule"]
+        sev = s["severity"]
+        color = SEVERITY_COLORS.get(sev, "#888")
+        status = "—"
+        now = False
+        if col in enriched.columns and "timestamp" in enriched.columns:
+            mask = enriched[col].fillna(False).astype(bool)
+            now = bool(mask.iloc[-1])
+            if mask.any():
+                status = "ACTIVE NOW" if now else "last seen " + enriched.loc[mask, "timestamp"].max().strftime("%d %b %H:%M")
+        weight = "800" if now else "600"
+        pct = min(max(float(s["rate_pct"]), 0.0), 100.0)
+        html = (
+            '<div style="background:' + SEV_BG.get(sev, "#F5F5F5") + ';border:1px solid '
+            + SEV_BDR.get(sev, "#ddd") + ';border-radius:10px;padding:10px 16px;margin-bottom:8px;">'
+            + SEV_ICON.get(sev, "") + ' <strong style="color:' + color + ';">' + s["label"] + '</strong>'
+            + '<span style="float:right;font-size:.78rem;color:' + color + ';font-weight:' + weight
+            + ';border:1px solid ' + color + ';border-radius:20px;padding:1px 8px;">'
+            + sev + ' · ' + status + '</span><br>'
+            + '<span style="font-size:.85rem;color:#546E7A;">' + s["description"] + '</span><br>'
+            + '<span style="font-size:.78rem;color:#78909C;">' + f"{s['events']:,} events · {pct:.1f}% of {scope}"
+            + ' · 📖 ' + s["reference"] + '</span>'
+            + '<div style="height:4px;background:#ECEFF1;border-radius:2px;margin-top:6px;">'
+            + '<div style="height:4px;width:' + f"{pct:.1f}" + '%;background:' + color + ';border-radius:2px;"></div></div>'
+            + '</div>'
+        )
+        st.markdown(html, unsafe_allow_html=True)
+    if clear:
+        with st.expander(f"✅ {len(clear)} rules with no events (all clear)", expanded=False):
+            for s in clear:
+                st.markdown(SEV_ICON.get(s["severity"], "⚪") + " **" + s["label"] + "** — "
+                            + s["description"])
 
 
 # Tab: Overview  (v3 — restructured layout, better KPIs, cleaner sparklines)
@@ -1183,60 +1305,16 @@ def _tab_overview(meas_df: pd.DataFrame, alarm_df: pd.DataFrame) -> None:
 
     st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
 
-    # ── Row 2: Priority sparkline charts (2-column layout) ────────────────────
+    # ── Row 2: Primary vitals (same chart as Live) ────────────────────────────
     if "timestamp" in meas_df.columns and meas_df["timestamp"].notna().any():
+        _kpi_row(meas_df, "Last Recorded Values")
         st.markdown("## Primary Vitals")
         _note(
-            "The two most clinically critical parameters: blood flow rate and oxygenator "
-            "pressure difference. Red circles mark moments when a device alarm was active."
+            "Blood flow, oxygenator pressure difference, saturation and pump speed. "
+            "The red strip underneath shows when a device alarm was active. "
+            "Pauses between recordings are not drawn; a dotted line marks where a new recording starts."
         )
-
-        col_l, col_r = st.columns(2)
-
-        for container, col, chart_title, y_unit in [
-            (col_l, "flow_rate_lpm",       "Blood Flow Rate Over Time",          "Blood Flow (L/min)"),
-            (col_r, "pressure_delta_mmhg",  "Oxygenator Pressure Difference",     "ΔPressure (mmHg)"),
-        ]:
-            if col not in meas_df.columns:
-                continue
-            with container:
-                fig = _base_fig(
-                    title=chart_title,
-                    xaxis_title="Time",
-                    yaxis_title=y_unit,
-                    height=300,
-                )
-                _measurement_trace(fig, meas_df["timestamp"], meas_df[col], name=y_unit)
-                if "alarm_active" in meas_df.columns:
-                    alm = meas_df[meas_df["alarm_active"] == 1]
-                    if not alm.empty:
-                        _alarm_trace(fig, alm["timestamp"], alm[col], show_legend=True)
-                fig.update_layout(margin=dict(l=55, r=20, t=55, b=55))
-                st.plotly_chart(fig, use_container_width=True)
-
-        # Secondary pair
-        col_l2, col_r2 = st.columns(2)
-        for container, col, chart_title, y_unit in [
-            (col_l2, "sat_pre_pct",    "Pre-oxygenator Oxygen Saturation", "SatO₂ (%)"),
-            (col_r2, "pump_speed_rpm", "Pump Speed Over Time",             "Pump Speed (RPM)"),
-        ]:
-            if col not in meas_df.columns:
-                continue
-            with container:
-                fig = _base_fig(
-                    title=chart_title,
-                    xaxis_title="Time",
-                    yaxis_title=y_unit,
-                    height=280,
-                )
-                _measurement_trace(fig, meas_df["timestamp"], meas_df[col], name=y_unit)
-                if "alarm_active" in meas_df.columns:
-                    alm = meas_df[meas_df["alarm_active"] == 1]
-                    if not alm.empty:
-                        _alarm_trace(fig, alm["timestamp"], alm[col], show_legend=False)
-                fig.update_layout(margin=dict(l=55, r=20, t=50, b=55),
-                                  showlegend=False)
-                st.plotly_chart(fig, use_container_width=True)
+        _trend_section(meas_df, DEFAULT_TREND_PARAMS, key="ov", row_h=190)
 
     # ── Row 3: Statistics table ───────────────────────────────────────────────
     with st.expander("📋 Full Measurement Statistics Table", expanded=False):
@@ -1284,7 +1362,7 @@ def _tab_trends(meas_df: pd.DataFrame, alarm_df: pd.DataFrame) -> None:
     _note(
         "Each panel shows how a parameter changed over the session. "
         "Gaps in the line indicate periods when the sensor signal was unavailable. "
-        "Red circles mark time points when a device alarm was active."
+        "The red strip underneath shows when a device alarm was active."
     )
 
     label_to_col = {DISPLAY_LABELS.get(c, c): c for c in available}
@@ -1306,59 +1384,7 @@ def _tab_trends(meas_df: pd.DataFrame, alarm_df: pd.DataFrame) -> None:
         return
 
     selected_cols = [label_to_col[l] for l in selected_labels]
-    n = len(selected_cols)
-
-    # Build shared-x subplot figure
-    subplot_titles = [
-        f"{DISPLAY_LABELS.get(c, c)}  —  {YAXIS_LABELS.get(c, '')}"
-        for c in selected_cols
-    ]
-    fig = make_subplots(
-        rows=n, cols=1,
-        shared_xaxes=True,
-        subplot_titles=subplot_titles,
-        vertical_spacing=max(0.06, min(0.14, 0.5 / n)),
-    )
-
-    # Style subplot titles
-    for ann in fig.layout.annotations:
-        ann.font = dict(size=15, color=C["primary"])
-        ann.x    = 0
-        ann.xanchor = "left"
-
-    show_alarm_legend = True
-    for i, col in enumerate(selected_cols, start=1):
-        _measurement_trace(fig, meas_df["timestamp"], meas_df[col],
-                           name=DISPLAY_LABELS.get(col, col), row=i, col=1)
-        if "alarm_active" in meas_df.columns:
-            alm = meas_df[meas_df["alarm_active"] == 1]
-            if not alm.empty:
-                _alarm_trace(fig, alm["timestamp"], alm[col],
-                             show_legend=show_alarm_legend, row=i, col=1)
-                show_alarm_legend = False  # show legend entry only once
-
-        # Y-axis label per subplot
-        y_label = YAXIS_LABELS.get(col, DISPLAY_LABELS.get(col, col))
-        fig.update_yaxes(
-            title_text=y_label,
-            title_font=dict(size=13),
-            tickfont=dict(size=12),
-            showgrid=True, gridcolor=C["grid"],
-            row=i, col=1,
-        )
-
-    fig.update_xaxes(
-        showgrid=True, gridcolor=C["grid"],
-        tickfont=dict(size=12),
-    )
-    fig.update_xaxes(title_text="Date / Time", title_font=dict(size=13), row=n, col=1)
-
-    fig.update_layout(
-        **CHART_BASE_SUB,
-        height=max(280, 230 * n),
-        legend=dict(orientation="h", y=-0.08, x=0, font=dict(size=13)),
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    _trend_section(meas_df, selected_cols, key="tr")
 
     # Alarm limit bands — advanced, hidden by default
     with st.expander("⚙️ Advanced — Show configured alarm limit bands", expanded=False):
@@ -1509,28 +1535,10 @@ def _tab_alarms(alarm_df: pd.DataFrame, meas_df: pd.DataFrame) -> None:
 
     # ── Primary: alarm timeline overlaid on flow rate ─────────────────────────
     st.markdown("### Alarm Timeline")
-    _note(
-        "Blood flow rate over time, with red circles marking every moment a device alarm was active. "
-        "Clusters of red circles indicate periods of sustained alarm activity requiring review."
-    )
-
+    _note("Blood flow with the red strip showing when a device alarm was active "
+          "(same chart as the Live monitor).")
     if "timestamp" in meas_df.columns and meas_df["timestamp"].notna().any():
-        fig = _base_fig(
-            title="Blood Flow Rate — with Alarm Events",
-            xaxis_title="Date / Time",
-            yaxis_title="Blood Flow (L/min)",
-            height=320,
-        )
-        if "flow_rate_lpm" in meas_df.columns:
-            _measurement_trace(fig, meas_df["timestamp"],
-                               meas_df["flow_rate_lpm"], name="Flow Rate (L/min)")
-        if "alarm_active" in meas_df.columns:
-            alm = meas_df[meas_df["alarm_active"] == 1]
-            if not alm.empty and "flow_rate_lpm" in meas_df.columns:
-                _alarm_trace(fig, alm["timestamp"], alm["flow_rate_lpm"],
-                             name="Alarm active")
-        fig.update_layout(legend=dict(orientation="h", y=-0.22, x=0))
-        st.plotly_chart(fig, use_container_width=True)
+        _trend_section(meas_df, ["flow_rate_lpm"], key="al", row_h=260)
 
     # ── Alarm type breakdown ──────────────────────────────────────────────────
     if "alarm_type" in alarm_df.columns:
@@ -1859,40 +1867,14 @@ def _tab_early_warning(meas_df: pd.DataFrame) -> None:
         st.warning("No measurement data available for this session.")
         return
 
-    # ── Patient parameters (optional — improve SAVE score) ───────────────────
-    with st.expander("⚙️ Optional — Enter patient parameters to improve SAVE score", expanded=False):
-        st.caption(
-            "These are used only for the SAVE score estimate. "
-            "If left blank, the score is computed from device data only."
-        )
-        p1, p2 = st.columns(2)
-        with p1:
-            age       = st.number_input("Patient age (years)", min_value=0, max_value=120,
-                                         value=0, step=1, key="ew_age")
-            weight_kg = st.number_input("Weight (kg)", min_value=0, max_value=300,
-                                         value=0, step=1, key="ew_weight")
-        with p2:
-            acute_myocarditis    = st.checkbox("Indication: acute myocarditis", key="ew_myo")
-            vt_vf                = st.checkbox("Indication: refractory VT/VF", key="ew_vtvf")
-            post_cardiac_surgery = st.checkbox("Indication: post-cardiac surgery", key="ew_pcs")
-
-    save_kwargs = dict(
-        age=age if age > 0 else None,
-        weight_kg=weight_kg if weight_kg > 0 else None,
-        acute_myocarditis=acute_myocarditis,
-        vt_vf=vt_vf,
-        post_cardiac_surgery=post_cardiac_surgery,
-    )
-
     # ── Run all rules ─────────────────────────────────────────────────────────
     with st.spinner("Analysing session against clinical rules…"):
         try:
-            enriched_df, summaries = run_all_rules(meas_df, save_kwargs=save_kwargs)
+            enriched_df, summaries = _run_rules(meas_df)
         except Exception as exc:
             st.error(f"Error running clinical rules: {exc}")
             return
 
-    # ── Summary KPI row ───────────────────────────────────────────────────────
     total_alerts = int(enriched_df["alert_any"].sum())
     total_recs   = len(enriched_df)
     n_critical   = sum(1 for s in summaries if s["severity"] == "CRITICAL" and s["events"] > 0)
@@ -1900,7 +1882,7 @@ def _tab_early_warning(meas_df: pd.DataFrame) -> None:
 
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Total Alert Events",  f"{total_alerts:,}",
-              help="Number of time points where at least one clinical rule fired.")
+              help="Minutes (1 sample/min) where at least one clinical rule fired.")
     k2.metric("Alert Coverage",
               f"{total_alerts / max(total_recs,1) * 100:.1f}% of session")
     k3.metric("Critical Rules Fired", str(n_critical),
@@ -1908,57 +1890,9 @@ def _tab_early_warning(meas_df: pd.DataFrame) -> None:
               delta_color="inverse" if n_critical > 0 else "off")
     k4.metric("High Rules Fired", str(n_high))
 
-    st.markdown('<hr style="border:none;border-top:1px solid var(--border);margin:1rem 0">', unsafe_allow_html=True)
-
-    # ── Per-rule alert cards ──────────────────────────────────────────────────
     st.markdown("### Rule-by-Rule Results")
-    _note(
-        "Each card shows one clinical alert rule. The bar indicates what "
-        "percentage of the session triggered that rule. "
-        "Rules with zero events are shown collapsed at the bottom."
-    )
-
-    SEVERITY_LABEL = {"CRITICAL": "🔴", "HIGH": "🟠", "MODERATE": "🟡", "LOW": "🔵"}
-    SEVERITY_SORT  = {"CRITICAL": 0, "HIGH": 1, "MODERATE": 2, "LOW": 3}
-
-    fired     = sorted([s for s in summaries if s["events"] > 0],
-                        key=lambda x: SEVERITY_SORT[x["severity"]])
-    not_fired = [s for s in summaries if s["events"] == 0]
-
-    for s in fired:
-        icon  = SEVERITY_LABEL.get(s["severity"], "⚪")
-        color = SEVERITY_COLORS.get(s["severity"], "#888")
-        pct   = s["rate_pct"]
-
-        with st.container():
-            h_col, v_col = st.columns([5, 1])
-            with h_col:
-                st.markdown(
-                    f"**{icon} {s['label']}** "
-                    f"<span style='font-size:.82rem;color:{color};font-weight:700;'>"
-                    f"{s['severity']}</span>",
-                    unsafe_allow_html=True,
-                )
-                st.progress(min(pct / 100, 1.0))
-                st.caption(
-                    f"{s['events']:,} events · {pct:.1f}% of session — "
-                    f"_{s['description']}_"
-                )
-                st.caption(f"📖 {s['reference']}")
-            with v_col:
-                st.metric(" ", f"{pct:.1f}%")
-        st.markdown("---")
-
-    if not_fired:
-        with st.expander(f"✅ {len(not_fired)} rules with no events (all clear)", expanded=False):
-            for s in not_fired:
-                icon = SEVERITY_LABEL.get(s["severity"], "⚪")
-                st.markdown(
-                    f"{icon} **{s['label']}** — "
-                    f"<span style='color:{C["ok"]};font-weight:600;'>No events detected</span>  "
-                    f"<span style='font-size:.80rem;color:{C["subtle"]};'>{s['description']}</span>",
-                    unsafe_allow_html=True,
-                )
+    _note("Same cards as the Live monitor. Rules are evaluated at 1 sample per minute.")
+    _alert_cards(enriched_df, summaries, "session")
 
     st.markdown('<hr style="border:none;border-top:1px solid var(--border);margin:1rem 0">', unsafe_allow_html=True)
 
@@ -1990,6 +1924,7 @@ def _tab_early_warning(meas_df: pd.DataFrame) -> None:
     )
 
     rows_with_data = [c for c in alert_cols if enriched_df[c].sum() > 0]
+    tl_df = pp.insert_gap_breaks(enriched_df)
     colors_cycle   = [C["alarm"], C["warn"], "#8E44AD", C["accent"], "#00BCD4", "#1E8449"]
 
     for i, col in enumerate(rows_with_data):
@@ -1997,11 +1932,11 @@ def _tab_early_warning(meas_df: pd.DataFrame) -> None:
         label     = col_to_label.get(rule_name, col)
         color     = colors_cycle[i % len(colors_cycle)]
         fig.add_trace(go.Scatter(
-            x=enriched_df["timestamp"],
-            y=enriched_df[col].astype(float),
+            x=tl_df["timestamp"],
+            y=tl_df[col].astype(float),
             mode="lines",
             name=label,
-            line=dict(width=2, color=color),
+            line=dict(width=2, color=color, shape="hv"),
             fill="tozeroy",
             fillcolor=color.replace(")", ",0.12)").replace("rgb", "rgba")
                 if color.startswith("rgb")
@@ -2014,35 +1949,26 @@ def _tab_early_warning(meas_df: pd.DataFrame) -> None:
         yaxis=dict(range=[-0.05, 1.3], tickvals=[0, 1],
                    ticktext=["Off", "Active"], tickfont=dict(size=12)),
     )
+    _gap_axes(fig, pp.find_recordings(enriched_df), 1)
     st.plotly_chart(fig, use_container_width=True)
 
-    # ── SAVE score section ────────────────────────────────────────────────────
-    st.markdown("### SAVE Score Estimate")
-    _note(
-        "The SAVE score (Schmidt et al., Eur Heart J 2015) estimates survival probability "
-        "in VA-ECMO patients. This is a partial calculation using only device-observable "
-        "parameters. Laboratory values (lactate, creatinine) are not included."
-    )
-
-    if "save_risk_level" in enriched_df.columns:
-        save_score   = enriched_df["save_score_partial"].median()
-        save_level   = enriched_df["save_risk_level"].mode()[0]
-        save_surv    = enriched_df["save_survival_est"].mode()[0]
-        save_note    = enriched_df["save_note"].iloc[0]
-
-        sc1, sc2, sc3 = st.columns(3)
-        sc1.metric("Partial SAVE Score (median)", f"{save_score:.1f}",
-                   help="Computed from device-observable parameters only.")
-        sc2.metric("Risk Level", save_level)
-        sc3.metric("Estimated Survival", save_surv,
-                   help="From Schmidt et al. Eur Heart J 2015 — full validated SAVE score.")
-
-        with st.expander("⚠️ Important note on the SAVE score", expanded=False):
-            st.warning(save_note)
-            st.markdown(
-                "Full validated calculator: "
-                "[www.save-score.com](https://www.save-score.com)"
-            )
+    # ── Evidence & limits ─────────────────────────────────────────────────────
+    with st.expander("📚 Evidence base and limits of these alerts", expanded=False):
+        st.markdown(
+            "- **Guidelines give trends, not numbers.** ELSO (circuit guideline) and Zakhary et al., "
+            "*Crit Care* 2020 say a rising oxygenator pressure drop, or dP/flow, signals clot; they "
+            "state that no cut-off defines dysfunction. The limits used here are **heuristic, "
+            "configurable defaults** (`clinical_rules.THRESHOLDS`).\n"
+            "- **Post-oxygenator gas exchange** is judged by PaO₂ (ELSO: > 300 mmHg at FdO₂ 1.0; "
+            "< 200 suggests failure). The log only has SatO₂, so this is a coarse signal; confirm with a blood gas.\n"
+            "- **Flow adequacy** is patient-specific and judged on perfusion markers (SvO₂, lactate).\n"
+            "- **Pump cavitation** needs inlet pressure, which the log does not contain; the rule "
+            "monitors flow per RPM instead.\n"
+            "- **SAVE score removed:** it needs pre-ECMO clinical and laboratory data that the device "
+            "log does not contain. Use the official calculator "
+            "([save-score.com](https://www.save-score.com)).\n"
+            "- Research / demo only. Not validated for clinical decisions."
+        )
 
     # ── Full enriched data (advanced) ─────────────────────────────────────────
     with st.expander("📋 Full alert data table (Advanced)", expanded=False):
@@ -2050,7 +1976,7 @@ def _tab_early_warning(meas_df: pd.DataFrame) -> None:
         show_cols = (
             ["timestamp"] +
             [c for c in enriched_df.columns if c.startswith("alert_")] +
-            ["save_score_partial", "save_risk_level"]
+            []
         )
         show_cols = [c for c in show_cols if c in enriched_df.columns]
         st.dataframe(enriched_df[show_cols], use_container_width=True, height=320)
@@ -2087,7 +2013,7 @@ def _tab_risk(
     ctrl1, ctrl2 = st.columns(2)
     with ctrl1:
         horizon = st.slider(
-            "Warning horizon (samples ahead)",
+            "Warning horizon (minutes ahead, 1 sample = 1 min)",
             min_value=2, max_value=20, value=5, step=1,
             help="How many samples ahead the model predicts. More = earlier warning, less precision.",
         )
@@ -2119,8 +2045,10 @@ def _tab_risk(
                 st.session_state.model_trained = True
                 st.session_state.pred_result  = None
                 st.success(
-                    f"✅ Model trained.  Detection quality (AUC): **{metrics['auc']:.3f}** "
-                    f"— values above 0.70 indicate useful predictive ability."
+                    f"✅ Model trained. AUC **{metrics['auc']:.3f}**, average precision "
+                    f"**{metrics['avg_precision']:.2f}** against a base rate of "
+                    f"**{metrics['base_rate_test']:.2f}** (a useless model scores the base rate). "
+                    "It forecasts a NEW device alarm, not patient outcomes."
                 )
             except Exception as exc:
                 st.error(f"Training failed: {exc}")
@@ -2137,7 +2065,7 @@ def _tab_risk(
         m = model.metrics
         mc1, mc2, mc3 = st.columns(3)
         mc1.metric("Detection Quality (AUC)", f"{m['auc']:.3f}",
-                   help="1.0 = perfect, 0.5 = random. Above 0.70 is clinically useful.")
+                   help="1.0 = perfect, 0.5 = random. Check average precision against the base rate too. Not clinically validated.")
         mc2.metric("Training samples", f"{m['train_samples']:,}")
         mc3.metric("Test samples",     f"{m['test_samples']:,}")
         if "report" in m:

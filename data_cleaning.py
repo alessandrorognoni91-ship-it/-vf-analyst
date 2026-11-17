@@ -259,26 +259,22 @@ def engineer_features(df: pd.DataFrame, window: int = 10) -> pd.DataFrame:
 
 def make_alarm_target(df: pd.DataFrame, horizon: int = 5) -> pd.DataFrame:
     """
-    Create a forward-looking binary target: will an alarm occur within
-    the next `horizon` samples?
+    Forward-looking target: will a device alarm be active at ANY of the next
+    `horizon` samples (t+1 ... t+horizon)?
 
-    This is more clinically useful than predicting the current alarm state
-    (which is already known from the device).
+    Rows in the last `horizon` samples have no complete future and get NaN
+    (they are dropped by the trainer, never silently labelled 0).
+    The trainer additionally keeps only rows with no alarm active NOW, so the
+    model learns to anticipate a NEW alarm instead of repeating the current one.
 
-    Returns df with an added column `alarm_future` (0/1).
+    NOTE: the target is a DEVICE ALARM, not a patient outcome. The model says
+    nothing about stroke, bleeding or survival.
     """
     if "alarm_active" not in df.columns:
-        df["alarm_future"] = 0
+        df["alarm_future"] = np.nan
         return df
 
-    alarm_series = df["alarm_active"].astype(int)
-    # Rolling max over the next `horizon` steps
-    df["alarm_future"] = (
-        alarm_series[::-1]
-        .rolling(horizon, min_periods=1)
-        .max()[::-1]
-        .shift(-horizon)
-        .fillna(0)
-        .astype(int)
-    )
+    a = df["alarm_active"].fillna(0).astype(int)
+    window_max = a[::-1].rolling(horizon, min_periods=horizon).max()[::-1]  # t .. t+h-1
+    df["alarm_future"] = window_max.shift(-1)                               # t+1 .. t+h
     return df

@@ -33,15 +33,12 @@ from data_loader import load_csv
 from data_cleaning import clean, compute_summary
 from data_model import VFDatabase
 from ml_model import VFModel
-import clinical_rules as _cr
 from clinical_rules import run_all_rules, SEVERITY_COLORS, RuleResult
 import plot_prep as pp
 import risk_index as ri
 
 # Fallback keeps the app alive if an OLD clinical_rules.py is still deployed.
-TH = getattr(_cr, "THRESHOLDS", {
-    "delta_high_mmhg": 60.0, "flow_low_lpm": 1.5, "sat_post_low_pct": 95.0,
-})
+TH = ri.TH
 from hl7_fhir import (
     session_to_fhir_bundle_json, measurements_to_hl7, get_mdc_nomenclature_table,
 )

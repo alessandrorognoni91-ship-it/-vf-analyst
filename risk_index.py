@@ -25,7 +25,18 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from clinical_rules import THRESHOLDS as TH
+# Self-contained defaults: the module still imports if an OLDER clinical_rules.py
+# (without THRESHOLDS) is deployed next to it. Values mirror clinical_rules.THRESHOLDS.
+_DEFAULTS = {
+    "delta_high_mmhg": 60.0, "resistance_rise_ratio": 1.30, "resistance_min_flow_lpm": 1.0,
+    "resistance_min_rise": 2.0, "flow_low_lpm": 1.5, "sat_post_low_pct": 95.0,
+    "pump_idle_rpm": 500.0, "flow_per_rpm_drop": 0.75, "temp_low_c": 35.0, "temp_high_c": 38.5,
+}
+try:
+    import clinical_rules as _cr
+    TH = {**_DEFAULTS, **getattr(_cr, "THRESHOLDS", {})}
+except Exception:  # pragma: no cover
+    TH = dict(_DEFAULTS)
 
 LEVELS = [(33.0, "LOW"), (66.0, "MODERATE"), (101.0, "HIGH")]
 

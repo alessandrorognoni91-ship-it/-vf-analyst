@@ -70,7 +70,7 @@ class LiveBuffer:
     Also flushes periodically to the SQLite database for persistence.
     """
 
-    MAX_ROWS  = 3600   # keep last 1 hour at 1 Hz
+    MAX_ROWS = 14400   # keep last 4 hours at 1 Hz (clot trend needs a 1 h look-back)
     FLUSH_SEC = 10     # write to DB every 10 seconds
 
     def __init__(self, db: VFDatabase, session_id: int):

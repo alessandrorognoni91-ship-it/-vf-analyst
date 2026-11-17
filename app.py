@@ -36,6 +36,7 @@ from ml_model import VFModel
 import clinical_rules as _cr
 from clinical_rules import run_all_rules, SEVERITY_COLORS, RuleResult
 import plot_prep as pp
+import risk_index as ri
 
 # Fallback keeps the app alive if an OLD clinical_rules.py is still deployed.
 TH = getattr(_cr, "THRESHOLDS", {
@@ -822,6 +823,12 @@ def _render_dashboard(
     alarm_count = int(meas_df["alarm_active"].sum()) if "alarm_active" in meas_df.columns else 0
     _render_case_header(meas_df, srow, alarm_count)
 
+    # ── Cockpit: the three risks on one screen ────────────────────────────────
+    _cockpit(meas_df, "cp", live=False)
+    st.divider()
+    if not st.toggle("Show advanced analysis (all tabs)", key="show_adv"):
+        return
+
     # ── Tabs ──────────────────────────────────────────────────────────────────
     (tab_ov, tab_tr, tab_dist,
      tab_al, tab_ew, tab_cmp, tab_coh,
@@ -1045,29 +1052,16 @@ def _tab_live_monitor(db: VFDatabase) -> None:
         format_func=lambda x: f"Every {x}s", key="live_refresh_sel",
     )
 
-    live_df = buf.get_dataframe(last_n=3600)
+    live_df = buf.get_dataframe(last_n=14400)
     if live_df.empty:
         st.info("⏳ Waiting for first data packet…")
         _time.sleep(1)
         st.rerun()
         return
 
-    _kpi_row(live_df, "Current Readings")
-    st.markdown('<hr style="margin:.6rem 0">', unsafe_allow_html=True)
-
-    st.markdown("### ⚕️ Clinical Alerts")
-    _note("Same rules as the file analysis, evaluated on everything buffered (up to 1 h) "
-          "at 1 sample per minute. 🔴 CRITICAL  🟠 HIGH  🟡 MODERATE  🔵 LOW")
-    try:
-        enriched, summaries = _run_rules(live_df)
-        _alert_cards(enriched, summaries, "buffer")
-    except Exception as exc:
-        st.warning(f"Alert engine error: {exc}")
-
-    st.markdown('<hr style="margin:.6rem 0">', unsafe_allow_html=True)
-    st.markdown("### Live Trends")
-    _note("Same chart as the file analysis. The red strip shows when a device alarm was active.")
-    _trend_section(live_df, DEFAULT_TREND_PARAMS, key="lv", live=True, row_h=170)
+    _cockpit(live_df, "lv", live=True)
+    with st.expander("Current readings", expanded=False):
+        _kpi_row(live_df, "Current Readings")
 
     # Safe auto-rerun
     _time.sleep(refresh_sec)
@@ -1272,6 +1266,146 @@ def _alert_cards(enriched: pd.DataFrame, summaries: list, scope: str) -> None:
             for s in clear:
                 st.markdown(SEV_ICON.get(s["severity"], "⚪") + " **" + s["label"] + "** — "
                             + s["description"])
+
+
+LEVEL_COL = {"LOW": "#2E7D32", "MODERATE": "#EF6C00", "HIGH": "#C62828",
+             "BASELINE": "#546E7A", "n/a": "#90A4AE"}
+LEVEL_BG = {"LOW": "#E8F5E9", "MODERATE": "#FFF3E0", "HIGH": "#FFEBEE",
+            "BASELINE": "#ECEFF1", "n/a": "#F5F5F5"}
+TREND_ARROW = {"rising": "▲ rising", "falling": "▼ falling", "steady": "→ steady"}
+
+
+def _risk_card(w, title: str, big: str, lvl: str, line1: str, line2: str) -> None:
+    col = LEVEL_COL.get(lvl, "#546E7A")
+    html = (
+        '<div style="background:' + LEVEL_BG.get(lvl, "#F5F5F5") + ';border:2px solid ' + col
+        + ';border-radius:14px;padding:14px 16px;min-height:150px;">'
+        + '<div style="font-size:.85rem;font-weight:700;color:#37474F;">' + title + '</div>'
+        + '<div style="font-size:2.1rem;font-weight:800;color:' + col + ';line-height:1.15;">' + big + '</div>'
+        + '<div style="font-size:.95rem;font-weight:700;color:' + col + ';">' + lvl + '</div>'
+        + '<div style="font-size:.80rem;color:#455A64;margin-top:4px;">' + line1 + '</div>'
+        + '<div style="font-size:.74rem;color:#78909C;">' + line2 + '</div></div>'
+    )
+    w.markdown(html, unsafe_allow_html=True)
+
+
+def _cockpit(df: pd.DataFrame, key: str, live: bool = False) -> None:
+    """ONE screen for CSV and Live: three risks, status, one chart."""
+    norm = pp.normalize_rate(df)
+    if norm.empty or len(norm) < 15:
+        st.info("Waiting for enough data (about 15 minutes of device log)…")
+        return
+    res = ri.assess(norm)
+    clot, cav = res["clot"], res["cavitation"]
+    others = [res[k] for k in ("gas", "lowflow", "instability", "temperature", "alarms")]
+
+    # optional clinical inputs for the neuro estimate
+    factors = {}
+    with st.expander("🧠 Optional clinical inputs for the brain-injury estimate", expanded=False):
+        st.caption("Not in the device log. Tick what applies; each factor multiplies the registry "
+                   "base risk by its published odds ratio.")
+        c = st.columns(3)
+        keys = ["low_pp", "hemolysis", "arrest", "arrhythmia", "rrt"]
+        for i, f in enumerate(keys):
+            factors[f] = c[i % 3].checkbox(ri.FACTOR_LABELS[f], key=key + "_nf_" + f)
+    factors["circuit_failure"] = bool(clot.get("available") and clot["level"] == "HIGH")
+    neuro = ri.neuro_estimate(factors)
+
+    # status banner
+    levels = [r["level"] for r in [clot, cav] + others if r.get("available")]
+    worst = "HIGH" if "HIGH" in levels else "MODERATE" if "MODERATE" in levels else "LOW"
+    msg = {"HIGH": "Attention: at least one indicator is HIGH",
+           "MODERATE": "Watch: at least one indicator is MODERATE",
+           "LOW": "All indicators low"}[worst]
+    last_t = norm["timestamp"].iloc[-1]
+    st.markdown(
+        '<div style="background:' + LEVEL_COL[worst] + ';color:white;border-radius:10px;'
+        'padding:8px 16px;font-weight:700;margin-bottom:10px;">' + msg
+        + '<span style="float:right;font-weight:500;opacity:.9;">'
+        + ("live · " if live else "file · ") + last_t.strftime("%d %b %H:%M") + '</span></div>',
+        unsafe_allow_html=True)
+
+    c1, c2, c3 = st.columns(3)
+
+    def _sub(r):
+        if live:
+            return "Trend " + TREND_ARROW[r["trend"]]
+        return ("Peak " + f"{r['peak']:.0f}" + " (" + r["peak_level"] + ") · moderate or higher "
+                + f"{r['pct_high']:.0f}% of the time")
+
+    if clot.get("available"):
+        _risk_card(c1, "🩸 CLOT RISK (oxygenator / circuit)", f"{clot['score']:.0f}/100", clot["level"],
+                   "Main signal: " + clot["driver"], _sub(clot))
+    if cav.get("available"):
+        _risk_card(c2, "🌀 CAVITATION / SUCTION RISK (indirect)", f"{cav['score']:.0f}/100", cav["level"],
+                   "Main signal: " + cav["driver"], _sub(cav))
+    a = neuro["abi"]
+    _risk_card(c3, "🧠 BRAIN-INJURY RISK (registry-based)", f"{a['p'] * 100:.0f}%", neuro["level"],
+               f"Any injury (base {a['base'] * 100:.0f}%) x{a['ratio']:.1f} · haemorrhage "
+               f"{neuro['ich']['p'] * 100:.1f}% (base {neuro['ich']['base'] * 100:.1f}%)"
+               + (" · circuit failure counted" if factors["circuit_failure"] else ""),
+               "VA-ECMO cardiogenic shock, adults. Not a stroke prediction.")
+
+    # all other predictors of alarms: one compact traffic-light row
+    chips = st.columns(len(others))
+    for w, r in zip(chips, others):
+        if not r.get("available"):
+            w.caption(r["title"] + ": no data")
+            continue
+        col = LEVEL_COL.get(r["level"], "#546E7A")
+        w.markdown(
+            '<div style="border-left:6px solid ' + col + ';background:' + LEVEL_BG.get(r["level"], "#F5F5F5")
+            + ';border-radius:8px;padding:6px 10px;">'
+            + '<div style="font-size:.72rem;color:#546E7A;font-weight:700;">' + r["title"] + '</div>'
+            + '<div style="font-size:1.05rem;font-weight:800;color:' + col + ';">' + r["level"]
+            + ' <span style="font-size:.75rem;font-weight:600;">' + f"{r['score']:.0f}" + '</span></div></div>',
+            unsafe_allow_html=True)
+        w.caption(r["driver"] if r["level"] != "LOW" else " ")
+
+    with st.expander("ℹ️ How to read these numbers", expanded=False):
+        st.markdown(
+            "- **All 0-100 values** (clot, cavitation, gas exchange, low flow, flow instability, temperature, device alarms) are transparent *indices*, not probabilities: 0-33 low, "
+            "34-65 moderate, 66+ high. They follow the trends described by ELSO (circuit guideline) "
+            "and Zakhary et al. 2020; ELSO gives no numeric cut-offs, so the scale is heuristic and "
+            "not validated.\n"
+            "- **Cavitation** cannot be measured: the device log has no inlet pressure. The index "
+            "uses loss of flow per RPM and unstable flow.\n"
+            "- **Brain injury** cannot be computed from the device. The % starts from the ELSO-registry "
+            "incidence (any ABI 11.1%, CNS ischaemia 6.2%, ICH 3.2%) and multiplies adjusted odds "
+            "ratios of the factors you tick (Kalra et al., 2023 preprint, not peer reviewed). "
+            "Circuit failure counts only for haemorrhage and is set automatically when the clot index is HIGH.\n"
+            "- Research / demo only. Not validated for clinical decisions.")
+        rows = []
+        for k, v in neuro.items():
+            if k == "level":
+                continue
+            rows.append({"Outcome": v["label"], "Registry base": f"{v['base'] * 100:.1f}%",
+                         "Estimate": f"{v['p'] * 100:.1f}%"})
+        st.table(pd.DataFrame(rows))
+
+    st.markdown("#### Trends")
+    _trend_section(df, DEFAULT_TREND_PARAMS, key=key + "_tr", live=live, row_h=170 if live else 190)
+
+    # risk-over-time (file only: where was it high?)
+    if not live:
+        with st.expander("📈 Risk indices over time", expanded=False):
+            fig = go.Figure()
+            palette = ["#C62828", "#1565C0", "#2E7D32", "#6A1B9A", "#EF6C00", "#00838F", "#546E7A"]
+            for (name, r), colr in zip([(v["title"], v) for v in res.values()], palette):
+                if r.get("available"):
+                    t = pp.insert_gap_breaks(pd.DataFrame({"timestamp": r["series_time"], "v": r["series"].values}))
+                    fig.add_trace(go.Scatter(x=t["timestamp"], y=t["v"], mode="lines", name=name,
+                                             line=dict(width=2, color=colr)))
+            fig.add_hline(y=33, line_dash="dot", line_color="#90A4AE")
+            fig.add_hline(y=66, line_dash="dot", line_color="#90A4AE")
+            fig.update_layout(**CHART_BASE_SUB, height=280, yaxis=dict(range=[0, 100], title="Index 0-100"),
+                              legend=dict(orientation="h", y=-0.2))
+            _gap_axes(fig, pp.find_recordings(norm), 1)
+            st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("#### Active alerts")
+    enriched, summaries = run_all_rules(norm)
+    _alert_cards(enriched, summaries, "buffer" if live else "session")
 
 
 # Tab: Overview  (v3 — restructured layout, better KPIs, cleaner sparklines)

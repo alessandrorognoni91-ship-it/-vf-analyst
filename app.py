@@ -1266,9 +1266,9 @@ def _alert_cards(enriched: pd.DataFrame, summaries: list, scope: str) -> None:
 
 
 LEVEL_COL = {"LOW": "#2E7D32", "MODERATE": "#EF6C00", "HIGH": "#C62828",
-             "BASELINE": "#546E7A", "n/a": "#90A4AE"}
+             "BASELINE": "#546E7A", "n/a": "#90A4AE", "OFF": "#90A4AE"}
 LEVEL_BG = {"LOW": "#E8F5E9", "MODERATE": "#FFF3E0", "HIGH": "#FFEBEE",
-            "BASELINE": "#ECEFF1", "n/a": "#F5F5F5"}
+            "BASELINE": "#ECEFF1", "n/a": "#F5F5F5", "OFF": "#F5F5F5"}
 TREND_ARROW = {"rising": "▲ rising", "falling": "▼ falling", "steady": "→ steady"}
 
 
@@ -1276,7 +1276,7 @@ def _risk_card(w, title: str, big: str, lvl: str, line1: str, line2: str) -> Non
     col = LEVEL_COL.get(lvl, "#546E7A")
     html = (
         '<div style="background:' + LEVEL_BG.get(lvl, "#F5F5F5") + ';border:2px solid ' + col
-        + ';border-radius:14px;padding:14px 16px;min-height:150px;">'
+        + ';border-radius:14px;padding:14px 16px;min-height:160px;margin-bottom:4px;">'
         + '<div style="font-size:.85rem;font-weight:700;color:#37474F;">' + title + '</div>'
         + '<div style="font-size:2.1rem;font-weight:800;color:' + col + ';line-height:1.15;">' + big + '</div>'
         + '<div style="font-size:.95rem;font-weight:700;color:' + col + ';">' + lvl + '</div>'
@@ -1286,6 +1286,17 @@ def _risk_card(w, title: str, big: str, lvl: str, line1: str, line2: str) -> Non
     w.markdown(html, unsafe_allow_html=True)
 
 
+def _chip(w, title: str, lvl: str, detail: str) -> None:
+    col = LEVEL_COL.get(lvl, "#546E7A")
+    w.markdown(
+        '<div style="border-left:6px solid ' + col + ';background:' + LEVEL_BG.get(lvl, "#F5F5F5")
+        + ';border-radius:8px;padding:8px 10px;min-height:78px;">'
+        + '<div style="font-size:.72rem;color:#546E7A;font-weight:700;">' + title + '</div>'
+        + '<div style="font-size:1.05rem;font-weight:800;color:' + col + ';">' + lvl + '</div>'
+        + '<div style="font-size:.72rem;color:#607D8B;">' + detail + '</div></div>',
+        unsafe_allow_html=True)
+
+
 def _cockpit(df: pd.DataFrame, key: str, live: bool = False) -> None:
     """ONE screen for CSV and Live: three risks, status, one chart."""
     norm = pp.normalize_rate(df)
@@ -1293,12 +1304,33 @@ def _cockpit(df: pd.DataFrame, key: str, live: bool = False) -> None:
         st.info("Waiting for enough data (about 15 minutes of device log)…")
         return
     res = ri.assess(norm)
+
+    # Demo / bench circuits (water, room temperature, odd saturations) make the
+    # physiological checks meaningless: let the user switch them off (auto-detected).
+    run = norm["pump_speed_rpm"].fillna(0) > ri.TH["pump_idle_rpm"] if "pump_speed_rpm" in norm.columns else None
+    temps = norm["temp_post_c"][run] if (run is not None and "temp_post_c" in norm.columns) else pd.Series(dtype=float)
+    auto_bench = bool(len(temps.dropna()) > 5 and temps.median() < 30.0)
+    bench = st.toggle(
+        "Demo / bench circuit: ignore temperature and saturation checks", value=auto_bench,
+        key=key + "_bench",
+        help="Switch on when the console runs a test loop or simulator (no patient): the "
+             "temperature and post-oxygenator SatO2 values are then not physiological. "
+             + ("Switched on automatically: median temperature while pumping is below 30 °C." if auto_bench else ""))
+    if bench:
+        for k in ("gas", "temperature"):
+            res[k]["level"] = "OFF"
     clot, cav = res["clot"], res["cavitation"]
     others = [res[k] for k in ("gas", "lowflow", "instability", "temperature", "alarms")]
 
-    # optional clinical inputs for the neuro estimate
+    # visual order: banner, three cards, indicator row, optional inputs
+    banner_c = st.container()
+    cards_c = st.container()
+    chips_c = st.container()
+    inputs_c = st.container()
+    inputs_c.markdown('<div style="height:10px"></div>', unsafe_allow_html=True)
+
     factors = {}
-    with st.expander("🧠 Optional clinical inputs for the brain-injury estimate", expanded=False):
+    with inputs_c.expander("🧠 Optional clinical inputs for the brain-injury estimate", expanded=False):
         st.caption("Not in the device log. Tick what applies; each factor multiplies the registry "
                    "base risk by its published odds ratio.")
         c = st.columns(3)
@@ -1308,27 +1340,32 @@ def _cockpit(df: pd.DataFrame, key: str, live: bool = False) -> None:
     factors["circuit_failure"] = bool(clot.get("available") and clot["level"] == "HIGH")
     neuro = ri.neuro_estimate(factors)
 
-    # status banner
-    levels = [r["level"] for r in [clot, cav] + others if r.get("available")]
-    worst = "HIGH" if "HIGH" in levels else "MODERATE" if "MODERATE" in levels else "LOW"
-    msg = {"HIGH": "Attention: at least one indicator is HIGH",
-           "MODERATE": "Watch: at least one indicator is MODERATE",
-           "LOW": "All indicators low"}[worst]
+    # status banner: say WHICH indicators drive it
+    live_ind = [r for r in [clot, cav] + others if r.get("available") and r["level"] not in ("OFF", "n/a")]
+    high = [r["title"] for r in live_ind if r["level"] == "HIGH"]
+    mod = [r["title"] for r in live_ind if r["level"] == "MODERATE"]
+    worst = "HIGH" if high else "MODERATE" if mod else "LOW"
+    if high:
+        msg = "Attention – HIGH: " + ", ".join(high) + (" · MODERATE: " + ", ".join(mod) if mod else "")
+    elif mod:
+        msg = "Watch – MODERATE: " + ", ".join(mod)
+    else:
+        msg = "All indicators low"
     last_t = norm["timestamp"].iloc[-1]
-    st.markdown(
+    banner_c.markdown(
         '<div style="background:' + LEVEL_COL[worst] + ';color:white;border-radius:10px;'
-        'padding:8px 16px;font-weight:700;margin-bottom:10px;">' + msg
+        'padding:10px 16px;font-weight:700;margin:4px 0 14px;">' + msg
         + '<span style="float:right;font-weight:500;opacity:.9;">'
-        + ("live · " if live else "file · ") + last_t.strftime("%d %b %H:%M") + '</span></div>',
+        + ("live · " if live else "file · ") + last_t.strftime("%d %b %Y %H:%M") + '</span></div>',
         unsafe_allow_html=True)
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3 = cards_c.columns(3, gap="medium")
 
     def _sub(r):
         if live:
             return "Trend " + TREND_ARROW[r["trend"]]
-        return ("Peak " + f"{r['peak']:.0f}" + " (" + r["peak_level"] + ") · moderate or higher "
-                + f"{r['pct_high']:.0f}% of the time")
+        return ("Peak " + f"{r['peak']:.0f}" + " on " + r["peak_time"].strftime("%d %b %H:%M")
+                + " · moderate or higher " + f"{r['pct_high']:.0f}% of the time")
 
     if clot.get("available"):
         _risk_card(c1, "🩸 CLOT RISK (oxygenator / circuit)", f"{clot['score']:.0f}/100", clot["level"],
@@ -1343,21 +1380,17 @@ def _cockpit(df: pd.DataFrame, key: str, live: bool = False) -> None:
                + (" · circuit failure counted" if factors["circuit_failure"] else ""),
                "VA-ECMO cardiogenic shock, adults. Not a stroke prediction.")
 
-    # all other predictors of alarms: one compact traffic-light row
-    chips = st.columns(len(others))
-    for w, r in zip(chips, others):
+    # all other predictors of alarms: one compact, aligned traffic-light row
+    chips_c.markdown('<div style="height:12px"></div>', unsafe_allow_html=True)
+    for w, r in zip(chips_c.columns(len(others), gap="small"), others):
         if not r.get("available"):
-            w.caption(r["title"] + ": no data")
+            _chip(w, r["title"], "n/a", "no data in the log")
             continue
-        col = LEVEL_COL.get(r["level"], "#546E7A")
-        w.markdown(
-            '<div style="border-left:6px solid ' + col + ';background:' + LEVEL_BG.get(r["level"], "#F5F5F5")
-            + ';border-radius:8px;padding:6px 10px;">'
-            + '<div style="font-size:.72rem;color:#546E7A;font-weight:700;">' + r["title"] + '</div>'
-            + '<div style="font-size:1.05rem;font-weight:800;color:' + col + ';">' + r["level"]
-            + ' <span style="font-size:.75rem;font-weight:600;">' + f"{r['score']:.0f}" + '</span></div></div>',
-            unsafe_allow_html=True)
-        w.caption(r["driver"] if r["level"] != "LOW" else " ")
+        if r["level"] == "OFF":
+            _chip(w, r["title"], "OFF", "bench / demo circuit")
+            continue
+        _chip(w, r["title"], r["level"], (f"{r['score']:.0f}/100 · " + r["driver"]) if r["level"] != "LOW"
+              else f"{r['score']:.0f}/100")
 
     with st.expander("ℹ️ How to read these numbers", expanded=False):
         st.markdown(
@@ -1402,6 +1435,9 @@ def _cockpit(df: pd.DataFrame, key: str, live: bool = False) -> None:
 
     st.markdown("#### Active alerts")
     enriched, summaries = run_all_rules(norm)
+    if bench:
+        summaries = [x for x in summaries if x["rule"] not in ("thermal_alert", "oxygenator_failure")]
+        st.caption("Bench / demo mode: temperature and oxygenator gas-exchange rules are hidden.")
     _alert_cards(enriched, summaries, "buffer" if live else "session")
 
 
